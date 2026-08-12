@@ -1,6 +1,6 @@
 # Registry #
 
-NOTE: This project uses C# version 6 features! You will need VS 2015 to compile it. Alternatively you can just use the DLL from the RegistryToolkit project.
+NOTE: This project uses C# version 6 features! You will need VS 2015 to compile it. Alternatively you can just use the DLL from the ExampleApp project.
 
 Full featured, offline Registry parser in C#. 
 
@@ -18,9 +18,9 @@ For discussion and design decisions, see http://binaryforay.blogspot.com/.
 ## General usage  ##
 The main Registry class has a LoggingConfiguration propery, NlogConfig. This should be set to a valid NLog config after instantiating a Registry object in order for the class to actually log something. This let you use any of the targets Nlog supports vs anything I could come up with plus the code is a lot cleaner.
 
-If you look at RegistryToolkit source you can see an example of how to implement both a ColoredConsole and File target.
+If you look at ExampleApp source you can see an example of how to implement both a ColoredConsole and File target.
 
-If you use -v 1 or -v 2 with RegistryToolkit you will get a large volume of information as the parser does its work. Of course higher levels of verbosity slow things down, but if you run into a problem, its a nice thing to have.
+If you use -v 1 or -v 2 with ExampleApp you will get a large volume of information as the parser does its work. Of course higher levels of verbosity slow things down, but if you run into a problem, its a nice thing to have.
 
 Registry will honor whatever LogLevels exist in your Nlog config.
 
