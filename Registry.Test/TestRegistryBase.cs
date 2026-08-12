@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.IO;
 using NFluent;
 using NUnit.Framework;
@@ -17,14 +17,14 @@ public class TestRegistryBase
     [Test]
     public void BcdHiveShouldHaveBcdHiveType()
     {
-        var r = new RegistryBase(@".\Hives\BCD");
+        var r = new RegistryBase(@"./Hives/BCD");
         Check.That(HiveTypeEnum.Bcd).IsEqualTo(r.HiveType);
     }
 
     [Test]
     public void DriversHiveShouldHaveDriversHiveType()
     {
-        var r = new RegistryBase(@".\Hives\Drivers");
+        var r = new RegistryBase(@"./Hives/DRIVERS");
         Check.That(HiveTypeEnum.Drivers).IsEqualTo(r.HiveType);
     }
 
@@ -44,22 +44,22 @@ public class TestRegistryBase
     [Test]
     public void HivePathShouldReflectWhatIsPassedIn()
     {
-        var security = new RegistryHiveOnDemand(@".\Hives\SECURITY");
+        var security = new RegistryHiveOnDemand(@"./Hives/SECURITY");
 
-        Check.That(security.HivePath).IsEqualTo(@".\Hives\SECURITY");
+        Check.That(security.HivePath).IsEqualTo(@"./Hives/SECURITY");
     }
 
     [Test]
     public void InvalidRegistryHiveShouldThrowException()
     {
-        Check.ThatCode(() => { new RegistryBase(@".\Hives\NotAHive"); }).Throws<Exception>();
+        Check.ThatCode(() => { new RegistryBase(@"./Hives/NotAHive"); }).Throws<Exception>();
     }
 
 
     [Test]
     public void NtuserHiveShouldHaveNtuserHiveType()
     {
-        var r = new RegistryBase(@".\Hives\NTUSER.DAT");
+        var r = new RegistryBase(@"./Hives/NTUSER.DAT");
         Check.That(HiveTypeEnum.NtUser).IsEqualTo(r.HiveType);
     }
 
@@ -93,6 +93,26 @@ public class TestRegistryBase
     }
 
     [Test]
+    public void HiveExactlyAtMaxByteArrayLengthShouldNotBeClamped()
+    {
+        // A stream length exactly equal to the CLR's max array length is allocatable as-is and
+        // must not be treated as "oversized" (off-by-one regression guard).
+        var count = RegistryBase.GetByteCountToRead(RegistryBase.MaxByteArrayLength, true, "hivePath");
+
+        Check.That(count).IsEqualTo(RegistryBase.MaxByteArrayLength);
+    }
+
+    [Test]
+    public void MaxByteArrayLengthMustBeSmallerThanIntMaxValue()
+    {
+        // Regression guard: int.MaxValue (0x7FFFFFFF) is 88 bytes larger than the CLR's actual max
+        // single-dimension array length. Allocating byte[int.MaxValue] throws "Array dimensions
+        // exceeded supported range". MaxByteArrayLength must stay strictly below int.MaxValue.
+        Check.That(RegistryBase.MaxByteArrayLength).IsStrictlyLessThan(int.MaxValue);
+        Check.That(int.MaxValue - RegistryBase.MaxByteArrayLength).IsEqualTo(0x38);
+    }
+
+    [Test]
     public void NormalSizedHiveShouldUseActualLength()
     {
         var count = RegistryBase.GetByteCountToRead(0x2000, false, "hivePath");
@@ -103,28 +123,28 @@ public class TestRegistryBase
     [Test]
     public void OtherHiveShouldHaveOtherHiveType()
     {
-        var r = new RegistryBase(@".\Hives\SAN(OTHER)");
+        var r = new RegistryBase(@"./Hives/SAN(OTHER)");
         Check.That(HiveTypeEnum.Other).IsEqualTo(r.HiveType);
     }
 
     [Test]
     public void SamHiveShouldHaveSamHiveType()
     {
-        var r = new RegistryBase(@".\Hives\SAM");
+        var r = new RegistryBase(@"./Hives/SAM");
         Check.That(HiveTypeEnum.Sam).IsEqualTo(r.HiveType);
     }
 
     [Test]
     public void SecurityHiveShouldHaveSecurityHiveType()
     {
-        var r = new RegistryBase(@".\Hives\Security");
+        var r = new RegistryBase(@"./Hives/SECURITY");
         Check.That(HiveTypeEnum.Security).IsEqualTo(r.HiveType);
     }
 
     [Test]
     public void ShouldTakeByteArrayInConstructor()
     {
-        var fileStream = new FileStream(@".\Hives\SAM", FileMode.Open, FileAccess.Read, FileShare.Read);
+        var fileStream = new FileStream(@"./Hives/SAM", FileMode.Open, FileAccess.Read, FileShare.Read);
         var binaryReader = new BinaryReader(fileStream);
 
         binaryReader.BaseStream.Seek(0, SeekOrigin.Begin);
@@ -134,17 +154,17 @@ public class TestRegistryBase
         binaryReader.Close();
         fileStream.Close();
 
-        var r = new RegistryBase(fileBytes, @".\Hives\SAM");
+        var r = new RegistryBase(fileBytes, @"./Hives/SAM");
 
         Check.That(r.Header).IsNotNull();
-        Check.That(r.HivePath).IsEqualTo(@".\Hives\SAM");
+        Check.That(r.HivePath).IsEqualTo(@"./Hives/SAM");
         Check.That(r.HiveType).IsEqualTo(HiveTypeEnum.Sam);
     }
 
     [Test]
     public void ShouldThrowExceptionWhenNotRegistryHiveAndByteArray()
     {
-        var fileStream = new FileStream(@".\Hives\NotAHive", FileMode.Open, FileAccess.Read, FileShare.Read);
+        var fileStream = new FileStream(@"./Hives/NotAHive", FileMode.Open, FileAccess.Read, FileShare.Read);
         var binaryReader = new BinaryReader(fileStream);
 
         binaryReader.BaseStream.Seek(0, SeekOrigin.Begin);
@@ -156,7 +176,7 @@ public class TestRegistryBase
 
         Check.ThatCode(() =>
             {
-                var rb = new RegistryBase(fileBytes, @".\Hives\NotAHive");
+                var rb = new RegistryBase(fileBytes, @"./Hives/NotAHive");
             })
             .Throws<ArgumentException>();
     }
@@ -164,21 +184,21 @@ public class TestRegistryBase
     [Test]
     public void SoftwareHiveShouldHaveSoftwareHiveType()
     {
-        var r = new RegistryBase(@".\Hives\software");
+        var r = new RegistryBase(@"./Hives/SOFTWARE");
         Check.That(HiveTypeEnum.Software).IsEqualTo(r.HiveType);
     }
 
     [Test]
     public void SystemHiveShouldHaveSystemHiveType()
     {
-        var r = new RegistryBase(@".\Hives\system");
+        var r = new RegistryBase(@"./Hives/SYSTEM");
         Check.That(HiveTypeEnum.System).IsEqualTo(r.HiveType);
     }
 
     [Test]
     public void UsrclassHiveShouldHaveUsrclassHiveType()
     {
-        var r = new RegistryBase(@".\Hives\UsrClass 1.dat");
+        var r = new RegistryBase(@"./Hives/UsrClass 1.dat");
         Check.That(HiveTypeEnum.UsrClass).IsEqualTo(r.HiveType);
     }
 

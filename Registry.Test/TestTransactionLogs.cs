@@ -69,12 +69,14 @@ public class TestTransactionLogs
 //        }
 
     [Test]
+    [Ignore("Unknown test source file.")]
     public void OneOff2()
     {
 
     }
 
     [Test]
+    [Ignore("Unknown test source file.")]
     public void OneOff()
     {
         var log1 = "C:\\Users\\eric\\Desktop\\RegistryExplorer - Failed to Load Hives\\Stack\\NTUSER.DAT.LOG1";

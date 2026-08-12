@@ -1,4 +1,4 @@
-﻿using NFluent;
+using NFluent;
 using NUnit.Framework;
 using Registry.Cells;
 
@@ -40,7 +40,7 @@ internal class TestNkCellRecord
     [Test]
     public void ShouldVerifyNkRecordProperties()
     {
-        var sam = new RegistryHive(@".\Hives\SAM");
+        var sam = new RegistryHive(@"./Hives/SAM");
         sam.FlushRecordListsAfterParse = false;
         sam.ParseHive();
 

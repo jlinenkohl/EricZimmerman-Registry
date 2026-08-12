@@ -1,4 +1,4 @@
-﻿using NFluent;
+using NFluent;
 using NUnit.Framework;
 using Registry.Cells;
 
@@ -10,7 +10,7 @@ internal class TestSkCellRecord
     [Test]
     public void SkRecordxAclNoDataForAceRecordsInSacl()
     {
-        var ntUserSlack = new RegistryHive(@".\Hives\NTUSER slack.DAT");
+        var ntUserSlack = new RegistryHive(@"./Hives/NTUSER slack.DAT");
         ntUserSlack.FlushRecordListsAfterParse = false;
         ntUserSlack.ParseHive();
 
@@ -34,7 +34,7 @@ internal class TestSkCellRecord
     [Test]
     public void VerifySkInfo()
     {
-        var sam = new RegistryHive(@".\Hives\SAM");
+        var sam = new RegistryHive(@"./Hives/SAM");
         sam.FlushRecordListsAfterParse = false;
         sam.ParseHive();
 
