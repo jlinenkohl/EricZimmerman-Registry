@@ -53,25 +53,17 @@ public class RegistryBase : IRegistry
         binaryReader.BaseStream.Seek(0, SeekOrigin.Begin);
 
         var streamLength = binaryReader.BaseStream.Length;
+        var byteCountToRead = GetByteCountToRead(streamLength, RegistryParseSettings.Exceeds2GbRecovery, hivePath);
 
-        if (streamLength > int.MaxValue)
+        if (byteCountToRead == int.MaxValue && streamLength > int.MaxValue)
         {
-            if (!RegistryParseSettings.Exceeds2GbRecovery)
-            {
-                throw new ArgumentOutOfRangeException(nameof(hivePath),
-                    $"Hive file size (0x{streamLength:X}) exceeds parser byte-array limit (0x{int.MaxValue:X}). Enable Exceeds2GbRecovery to load the maximum supported bytes.");
-            }
-
             var msg =
                 $"Exceeds2GbRecovery enabled: hive file size is 0x{streamLength:X}, loading first 0x{int.MaxValue:X} bytes due to parser byte-array limit.";
             Log.Warning(msg);
             RegistryParseSettings.RecordCorruption(msg);
-            FileBytes = binaryReader.ReadBytes(int.MaxValue);
         }
-        else
-        {
-            FileBytes = binaryReader.ReadBytes((int) streamLength);
-        }
+
+        FileBytes = binaryReader.ReadBytes(byteCountToRead);
 
         binaryReader.Close();
         fileStream.Close();
@@ -251,5 +243,21 @@ public class RegistryBase : IRegistry
             $"Exceeds2GbRecovery padded hive bytes from 0x{(ulong)originalLength:X} to declared length 0x{declaredFileLength:X}.";
         Log.Warning(resizeMessage);
         RegistryParseSettings.RecordCorruption(resizeMessage);
+    }
+
+    internal static int GetByteCountToRead(long streamLength, bool exceeds2GbRecovery, string hivePath)
+    {
+        if (streamLength <= int.MaxValue)
+        {
+            return (int)streamLength;
+        }
+
+        if (!exceeds2GbRecovery)
+        {
+            throw new ArgumentOutOfRangeException(nameof(hivePath),
+                $"Hive file size (0x{streamLength:X}) exceeds parser byte-array limit (0x{int.MaxValue:X}). Enable Exceeds2GbRecovery to load the maximum supported bytes.");
+        }
+
+        return int.MaxValue;
     }
 }

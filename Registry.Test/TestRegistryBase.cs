@@ -78,6 +78,29 @@ public class TestRegistryBase
     }
 
     [Test]
+    public void OversizedHiveWithoutRecoveryShouldThrowArgumentOutOfRangeException()
+    {
+        Check.ThatCode(() => { RegistryBase.GetByteCountToRead((long)int.MaxValue + 1, false, "hivePath"); })
+            .Throws<ArgumentOutOfRangeException>();
+    }
+
+    [Test]
+    public void OversizedHiveWithRecoveryShouldClampReadLengthToIntMaxValue()
+    {
+        var count = RegistryBase.GetByteCountToRead((long)int.MaxValue + 1, true, "hivePath");
+
+        Check.That(count).IsEqualTo(int.MaxValue);
+    }
+
+    [Test]
+    public void NormalSizedHiveShouldUseActualLength()
+    {
+        var count = RegistryBase.GetByteCountToRead(0x2000, false, "hivePath");
+
+        Check.That(count).IsEqualTo(0x2000);
+    }
+
+    [Test]
     public void OtherHiveShouldHaveOtherHiveType()
     {
         var r = new RegistryBase(@".\Hives\SAN(OTHER)");
