@@ -914,9 +914,13 @@ public class RegistryHive : RegistryBase
             {
                 Log.Debug("Found hbin with size 0 at absolute offset {Offset}. Skipping 0x1000 bytes...",
                     $"0x{offsetInHive:X}");
-                // Go to end if we find a 0 size block (padding?)
-                offsetInHive += 4096; //HiveLength();
-                TotalBytesRead += 4096;
+                // Go to end if we find a 0 size block (padding?). Cap the skip so offsetInHive/TotalBytesRead
+                // never overshoot hiveLength when fewer than 4096 bytes remain (e.g. a short tail left after
+                // Exceeds2GbRecovery truncation), which would otherwise make TotalBytesRead misreport more
+                // bytes as "read" than were actually available.
+                var paddingSkip = (int) Math.Min(4096, hiveLength - offsetInHive);
+                offsetInHive += paddingSkip;
+                TotalBytesRead += paddingSkip;
                 continue;
             }
 
@@ -935,8 +939,9 @@ public class RegistryHive : RegistryBase
 //                    }
                 if (RegistryParseSettings.ContinueOnCorruption)
                 {
-                    offsetInHive += 4096;
-                    TotalBytesRead += 4096;
+                    var corruptionSkip = (int) Math.Min(4096, hiveLength - offsetInHive);
+                    offsetInHive += corruptionSkip;
+                    TotalBytesRead += corruptionSkip;
                     continue;
                 }
 
@@ -1053,17 +1058,24 @@ public class RegistryHive : RegistryBase
             var remainingHive = ReadBytesFromHive(TotalBytesRead, (int) (HiveLength() - TotalBytesRead));
 
             //Sometimes the remainder of the file is all zeros, which is useless, so check for that
-            if (!Array.TrueForAll(remainingHive, a => a == 0))
+            var remainderIsAllZero = Array.TrueForAll(remainingHive, a => a == 0);
+
+            if (!remainderIsAllZero)
+            {
                 Log.Warning(
                     "Extra, non-zero data found beyond hive length! Check for erroneous data starting at {BytesRead}!",
                     $"0x{TotalBytesRead:X}");
 
-            //as a second check, compare Header length with what we read (taking the header into account as Header.Length is only for hbin records)
-
-            if (Header.Length != TotalBytesRead - 0x1000)
-                Log.Warning( //ncrunch: no coverage
-                    "Hive length ({HiveLength}) does not equal bytes read ({TotalBytesRead})!! Check the end of the hive for erroneous data",
-                    $"0x{HiveLength():X}", $"0x{TotalBytesRead:X}");
+                //as a second check, compare Header length with what we read (taking the header into account as Header.Length is only for hbin records).
+                //Only warn here when the extra data is actually non-zero: benign trailing padding/slack space
+                //(the common case once a hive is loaded via Exceeds2GbRecovery) already produced the warning
+                //above when non-zero, so this avoids a redundant, misleading "erroneous data" warning for
+                //harmless all-zero padding.
+                if (Header.Length != TotalBytesRead - 0x1000)
+                    Log.Warning( //ncrunch: no coverage
+                        "Hive length ({HiveLength}) does not equal bytes read ({TotalBytesRead})!! Check the end of the hive for erroneous data",
+                        $"0x{HiveLength():X}", $"0x{TotalBytesRead:X}");
+            }
         }
 
         if (RecoverDeleted) BuildDeletedRegistryKeys();
