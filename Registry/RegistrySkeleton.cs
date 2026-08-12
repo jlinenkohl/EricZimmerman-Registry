@@ -29,6 +29,8 @@ public class RegistrySkeleton
 
     private readonly List<SkeletonKeyRoot> _keys;
 
+    private readonly HashSet<string> _excludedKeyPaths = new(StringComparer.OrdinalIgnoreCase);
+
     private readonly Dictionary<long, int> _skMap = new();
 
     private int _currentOffsetInHbin = 0x20;
@@ -118,6 +120,52 @@ public class RegistrySkeleton
         _keys.Remove(intKey);
 
         return true;
+    }
+
+    /// <summary>
+    ///     Removes every previously-added entry whose KeyPath equals <paramref name="keyPath" /> or is nested
+    ///     beneath it (i.e. KeyPath == keyPath or KeyPath starts with "keyPath\"), in a single O(n) pass.
+    ///     <remarks>
+    ///         Intended for bulk pruning of large subtrees (e.g. hundreds of thousands of subkeys), where
+    ///         repeatedly calling <see cref="RemoveEntry" /> one entry at a time would be O(n^2) since it
+    ///         performs a linear scan per call.
+    ///     </remarks>
+    /// </summary>
+    /// <param name="keyPath">The key path (subtree root) to remove, along with everything nested beneath it.</param>
+    /// <returns>The number of entries removed.</returns>
+    public int RemoveEntrySubtree(string keyPath)
+    {
+        if (keyPath.StartsWith(_hive.Root.KeyName, StringComparison.OrdinalIgnoreCase) == false)
+        {
+            keyPath = $"{_hive.Root.KeyName}\\{keyPath}";
+        }
+
+        var prefix = keyPath + "\\";
+
+        return _keys.RemoveAll(k =>
+            string.Equals(k.KeyPath, keyPath, StringComparison.OrdinalIgnoreCase) ||
+            k.KeyPath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    ///     Excludes the given key path (and, implicitly, everything nested beneath it, since ProcessKey never
+    ///     descends into an excluded key) from the output hive produced by <see cref="Write" />.
+    ///     <remarks>
+    ///         Unlike <see cref="RemoveEntrySubtree" />, which only removes entries this skeleton was told to
+    ///         explicitly add, this affects the *default* recursive copy behavior: when reproducing an entire
+    ///         hive (or a large subtree) via <see cref="AddEntry" /> with <c>Recursive = true</c>, excluded
+    ///         key paths are skipped entirely rather than being copied into the output.
+    ///     </remarks>
+    /// </summary>
+    /// <param name="keyPath">The key path (subtree root) to exclude when writing the output hive.</param>
+    public void ExcludeSubtree(string keyPath)
+    {
+        if (keyPath.StartsWith(_hive.Root.KeyName, StringComparison.OrdinalIgnoreCase) == false)
+        {
+            keyPath = $"{_hive.Root.KeyName}\\{keyPath}";
+        }
+
+        _excludedKeyPaths.Add(keyPath);
     }
 
     private byte[] GetEmptyHbin(int size)
@@ -452,7 +500,9 @@ public class RegistrySkeleton
         {
             var subkeyOffsets = new Dictionary<int, string>();
 
-            foreach (var registryKey in key.SubKeys)
+            var subKeysToInclude = key.SubKeys.Where(sk => !IsExcluded(sk.KeyPath)).ToList();
+
+            foreach (var registryKey in subKeysToInclude)
             {
                 var subkeyOffset = ProcessKey(registryKey, nkOffset, addValues, true);
 
@@ -463,24 +513,18 @@ public class RegistrySkeleton
                 subkeyOffsets.Add(subkeyOffset, hash);
             }
 
-            //TODO this should generate an ri list pointing to lh lists when the number of subkeys > 500. each lh should be 500 in size
-            //TODO test this with some hive that has a ton of keys
+            //TODO test the ri-chaining path below with additional real-world hives that have >500 subkeys under a single key
 
-            //write list and save address
-            var subkeyListBytes = BuildlfList(subkeyOffsets);
-
-            CheckhbinSize(subkeyListBytes.RawBytes.Length);
-            subkeyListBytes.RawBytes.CopyTo(_hbin, _currentOffsetInHbin);
+            //write list and save address (chunks into multiple lf lists + a chaining ri list when needed)
+            var subkeyListOffset = WriteSubkeyList(subkeyOffsets);
 
             //update nk record pointers to subkeylist and subkey count
-            BitConverter.GetBytes(_currentOffsetInHbin).CopyTo(nkBytes, SubkeyListsStableCellIndex);
+            BitConverter.GetBytes(subkeyListOffset).CopyTo(nkBytes, SubkeyListsStableCellIndex);
             BitConverter.GetBytes(subkeyOffsets.Count).CopyTo(nkBytes, SubkeyCountStableOffset);
 
             //update size to always be negative so it shows up in other tools
             //TODO maybe this needs to be optional
             BitConverter.GetBytes(-1 * nkBytes.Length).CopyTo(nkBytes, 0);
-
-            _currentOffsetInHbin += subkeyListBytes.RawBytes.Length;
         }
 
         //update nkBytes
@@ -538,6 +582,99 @@ public class RegistrySkeleton
         return parentOffset;
     }
 
+
+    private bool IsExcluded(string keyPath)
+    {
+        if (_excludedKeyPaths.Count == 0) return false;
+
+        foreach (var excluded in _excludedKeyPaths)
+        {
+            if (string.Equals(keyPath, excluded, StringComparison.OrdinalIgnoreCase)) return true;
+            if (keyPath.StartsWith(excluded + "\\", StringComparison.OrdinalIgnoreCase)) return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    ///     Writes the given subkey offset/hash pairs as one or more "lf" list records, chunked into groups of
+    ///     at most 500 entries (a real-world Windows-observed convention), chained together via an "ri" list
+    ///     record when more than one chunk is required. Returns the relative offset of whichever list record
+    ///     the owning NK's SubkeyListsStableCellIndex should point to (either the single "lf" list, or the "ri"
+    ///     list if chunking was needed).
+    /// </summary>
+    private int WriteSubkeyList(Dictionary<int, string> subkeyOffsets)
+    {
+        const int maxEntriesPerLfList = 500;
+
+        if (subkeyOffsets.Count <= maxEntriesPerLfList)
+        {
+            var lfBytes = BuildlfList(subkeyOffsets);
+            CheckhbinSize(lfBytes.RawBytes.Length);
+            var lfOffset = _currentOffsetInHbin;
+            lfBytes.RawBytes.CopyTo(_hbin, lfOffset);
+            _currentOffsetInHbin += lfBytes.RawBytes.Length;
+            return lfOffset;
+        }
+
+        // Chunk into groups of maxEntriesPerLfList, write each as its own "lf" list, then chain them via "ri".
+        var chunkOffsets = new List<int>();
+        var chunk = new Dictionary<int, string>();
+
+        foreach (var entry in subkeyOffsets)
+        {
+            chunk.Add(entry.Key, entry.Value);
+
+            if (chunk.Count == maxEntriesPerLfList)
+            {
+                chunkOffsets.Add(WriteLfChunk(chunk));
+                chunk = new Dictionary<int, string>();
+            }
+        }
+
+        if (chunk.Count > 0)
+        {
+            chunkOffsets.Add(WriteLfChunk(chunk));
+        }
+
+        var riBytes = BuildRiList(chunkOffsets);
+        CheckhbinSize(riBytes.Length);
+        var riOffset = _currentOffsetInHbin;
+        riBytes.CopyTo(_hbin, riOffset);
+        _currentOffsetInHbin += riBytes.Length;
+
+        return riOffset;
+    }
+
+    private int WriteLfChunk(Dictionary<int, string> chunk)
+    {
+        var lfBytes = BuildlfList(chunk);
+        CheckhbinSize(lfBytes.RawBytes.Length);
+        var lfOffset = _currentOffsetInHbin;
+        lfBytes.RawBytes.CopyTo(_hbin, lfOffset);
+        _currentOffsetInHbin += lfBytes.RawBytes.Length;
+        return lfOffset;
+    }
+
+    private byte[] BuildRiList(List<int> chunkOffsets)
+    {
+        var totalSize = 4 + 2 + 2 + chunkOffsets.Count * 4; //size + sig + num entries + offsets
+
+        var listBytes = new byte[totalSize];
+
+        BitConverter.GetBytes(-1 * totalSize).CopyTo(listBytes, 0);
+        Encoding.ASCII.GetBytes("ri").CopyTo(listBytes, 4);
+        BitConverter.GetBytes((short) chunkOffsets.Count).CopyTo(listBytes, 6);
+
+        var index = 0x8;
+        foreach (var offset in chunkOffsets)
+        {
+            BitConverter.GetBytes(offset).CopyTo(listBytes, index);
+            index += 4;
+        }
+
+        return listBytes;
+    }
 
     private LxListRecord BuildlfList(Dictionary<int, string> subkeyInfo)
     {

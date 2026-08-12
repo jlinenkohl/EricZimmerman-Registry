@@ -4,6 +4,9 @@
         <TargetFramework>net8.0</TargetFramework>
         <OutputType>Exe</OutputType>
         <IsPackable>false</IsPackable>
+        <AssemblyName>RegistryToolkit</AssemblyName>
+        <RootNamespace>RegistryToolkit</RootNamespace>
+        <Description>CLI toolkit for analyzing, validating, and repairing Windows Registry hive files (parsing, integrity checks, oversized/truncated hive recovery, bloat analysis, and key pruning/compaction).</Description>
     </PropertyGroup>
 
     <ItemGroup>

@@ -4,9 +4,13 @@ using System.IO;
 using System.Linq;
 using CommandLine;
 using Registry;
+using Registry.Analysis;
 using Registry.Cells;
+using Registry.Compaction;
 using Serilog;
 using Serilog.Events;
+
+namespace RegistryToolkit;
 
 internal class Program
 {
@@ -88,6 +92,23 @@ internal class Program
         }
 
         PrintHiveSummary("Original hive", options.HivePath, originalHive, options.RecoverDeleted);
+
+        if (options.AnalyzeBloat)
+        {
+            PrintBloatAnalysis(originalHive);
+        }
+
+        if (!string.IsNullOrWhiteSpace(options.PruneKeyPath))
+        {
+            RunPruneKey(originalHive, options);
+            return 0;
+        }
+
+        if (options.Compact)
+        {
+            RunCompact(originalHive, options);
+            return 0;
+        }
 
         byte[] correctedBytes = null;
 
@@ -336,6 +357,151 @@ internal class Program
             Console.WriteLine($"Parse error: {ex.Message}");
             Console.WriteLine($"hard parsing errors (before failure): {hive.HardParsingErrors:N0}");
             Console.WriteLine($"soft parsing errors (before failure): {hive.SoftParsingErrors:N0}");
+        }
+    }
+
+    private static void PrintBloatAnalysis(RegistryHive hive)
+    {
+        Console.WriteLine("================================================================================");
+        Console.WriteLine("Bloat / integrity analysis (--analyzeBloat)");
+
+        try
+        {
+            var reachability = HiveAnalyzer.AnalyzeReachability(hive);
+            Console.WriteLine(
+                $"Reachability: reachableKeys={reachability.ReachableKeys:N0}, reachableValues={reachability.ReachableValues:N0}, totalInUseKeyCells={reachability.TotalInUseKeyCells:N0}, totalInUseValueCells={reachability.TotalInUseValueCells:N0}");
+
+            var topSubkeys = HiveAnalyzer.GetTopSubkeyCounts(hive);
+            Console.WriteLine($"Top subkey-count keys (>= 50 subkeys): {topSubkeys.Count}");
+            foreach (var entry in topSubkeys.OrderByDescending(k => k.SubkeyCount).Take(10))
+            {
+                Console.WriteLine($"  {entry.SubkeyCount:N0} subkeys, {entry.ValueCount:N0} values: {entry.KeyPath}");
+            }
+
+            var topValues = HiveAnalyzer.GetTopValueCounts(hive);
+            Console.WriteLine($"Top value-count keys (>= 50 values): {topValues.Count}");
+            foreach (var entry in topValues.OrderByDescending(k => k.ValueCount).Take(10))
+            {
+                Console.WriteLine($"  {entry.ValueCount:N0} values: {entry.KeyPath}");
+            }
+
+            if (topSubkeys.Count > 0)
+            {
+                var biggest = topSubkeys.OrderByDescending(k => k.SubkeyCount).First();
+                var pattern = HiveAnalyzer.AnalyzeSubkeyNamingPattern(hive, biggest.KeyPath);
+
+                if (pattern != null && pattern.TemplateGroups.Count > 0)
+                {
+                    Console.WriteLine(
+                        $"Subkey naming pattern under largest key '{pattern.KeyPath}' ({pattern.TotalSubkeys:N0} subkeys):");
+                    foreach (var group in pattern.TemplateGroups.OrderByDescending(g => g.Count).Take(5))
+                    {
+                        Console.WriteLine(
+                            $"  Template '{group.Template}': {group.Count:N0} matches, oldest={group.OldestLastWrite:O}, newest={group.NewestLastWrite:O}");
+                    }
+
+                    Console.WriteLine(
+                        "  If this pattern shows a large count with an incrementing counter suffix and a wide LastWrite spread, it likely indicates an application/service bug (e.g. an unbounded cache) rather than corruption. Consider --pruneKey to remediate.");
+                }
+            }
+
+            var duplicates = HiveAnalyzer.FindDuplicateCellGroups(hive, 16);
+            var significantDuplicates = duplicates.Where(d => d.Count >= 1000).OrderByDescending(d => d.Count).Take(5).ToList();
+            if (significantDuplicates.Count > 0)
+            {
+                Console.WriteLine("Large duplicate-signature cell groups (first 16 bytes of payload):");
+                foreach (var dup in significantDuplicates)
+                {
+                    Console.WriteLine($"  {dup.Count:N0} cells share signature {dup.Signature}, ~{dup.EstimatedWastedBytes:N0} bytes");
+                }
+
+                Console.WriteLine(
+                    "  Note: large duplicate-signature groups are commonly caused by many sibling keys sharing the same small set of value names/sizes (templated data), not literal record duplication/corruption. Cross-reference with the subkey naming pattern report above.");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Bloat analysis failed: {ex.Message}");
+        }
+    }
+
+    private static void RunPruneKey(RegistryHive hive, Options options)
+    {
+        Console.WriteLine("================================================================================");
+        Console.WriteLine($"Pruning key: {options.PruneKeyPath} (keeping {options.KeepRecent:N0} most-recently-written subkeys)");
+
+        if (string.IsNullOrWhiteSpace(options.OutputPath))
+        {
+            Console.WriteLine("ERROR: --pruneKey requires -o/--output to specify where the pruned hive should be written.");
+            return;
+        }
+
+        try
+        {
+            var plan = HivePruner.PlanPrune(hive, options.PruneKeyPath, options.KeepRecent);
+            Console.WriteLine(
+                $"Plan: totalSubkeys={plan.TotalSubkeyCount:N0}, retaining={plan.RetainCount:N0}, pruning={plan.PruneCount:N0}");
+
+            if (plan.PruneCount == 0)
+            {
+                Console.WriteLine("Nothing to prune (subkey count is already at or below --keepRecent).");
+                return;
+            }
+
+            var outputDir = Path.GetDirectoryName(options.OutputPath);
+            if (!string.IsNullOrWhiteSpace(outputDir) && !Directory.Exists(outputDir))
+            {
+                Directory.CreateDirectory(outputDir);
+            }
+
+            HivePruner.PruneKeyToFile(hive, options.PruneKeyPath, options.KeepRecent, options.OutputPath);
+            Console.WriteLine($"Pruned hive written to: {options.OutputPath}");
+
+            var prunedFileInfo = new FileInfo(options.OutputPath);
+            var originalFileInfo = new FileInfo(hive.HivePath);
+            Console.WriteLine(
+                $"Size before: {originalFileInfo.Length:N0} bytes, after: {prunedFileInfo.Length:N0} bytes ({(originalFileInfo.Length - prunedFileInfo.Length):N0} bytes removed)");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Prune failed: {ex.Message}");
+        }
+    }
+
+    private static void RunCompact(RegistryHive hive, Options options)
+    {
+        Console.WriteLine("================================================================================");
+        Console.WriteLine("Compacting hive (--compact)");
+
+        if (string.IsNullOrWhiteSpace(options.OutputPath))
+        {
+            Console.WriteLine("ERROR: --compact requires -o/--output to specify where the compacted hive should be written.");
+            return;
+        }
+
+        try
+        {
+            var outputDir = Path.GetDirectoryName(options.OutputPath);
+            if (!string.IsNullOrWhiteSpace(outputDir) && !Directory.Exists(outputDir))
+            {
+                Directory.CreateDirectory(outputDir);
+            }
+
+            var skeleton = new RegistrySkeleton(hive);
+            var rootEntry = new SkeletonKeyRoot(hive.Root.KeyName, true, true);
+            skeleton.AddEntry(rootEntry);
+            skeleton.Write(options.OutputPath);
+
+            Console.WriteLine($"Compacted hive written to: {options.OutputPath}");
+
+            var compactedFileInfo = new FileInfo(options.OutputPath);
+            var originalFileInfo = new FileInfo(hive.HivePath);
+            Console.WriteLine(
+                $"Size before: {originalFileInfo.Length:N0} bytes, after: {compactedFileInfo.Length:N0} bytes ({(originalFileInfo.Length - compactedFileInfo.Length):N0} bytes removed). This drops free/deleted cell slack but keeps all live keys/values; use --pruneKey to actually remove bloated key data.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Compaction failed: {ex.Message}");
         }
     }
 }

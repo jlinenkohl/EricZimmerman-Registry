@@ -1,6 +1,8 @@
 using System.Text;
 using CommandLine;
 
+namespace RegistryToolkit;
+
 internal class Options
 {
     [Option('f', "file", Required = true,
@@ -39,6 +41,22 @@ internal class Options
         HelpText = "Enable oversized/truncated hive recovery mode")]
     public bool Exceeds2GbRecovery { get; set; }
 
+    [Option("analyzeBloat", Default = false, Required = false,
+        HelpText = "Analyze the hive for abnormal size/bloat (duplicate cell patterns, top subkey/value counts, offset distribution, reachability check) and print a report")]
+    public bool AnalyzeBloat { get; set; }
+
+    [Option("pruneKey", Required = false,
+        HelpText = "Key path (relative to hive root) whose subkeys should be pruned, keeping only the N most recently written (use with --keepRecent and -o/--output)")]
+    public string PruneKeyPath { get; set; }
+
+    [Option("keepRecent", Default = 500, Required = false,
+        HelpText = "Number of most-recently-written subkeys to retain under --pruneKey (default 500)")]
+    public int KeepRecent { get; set; }
+
+    [Option("compact", Default = false, Required = false,
+        HelpText = "Rewrite the hive to -o/--output, dropping deleted/free cells (general size compaction, independent of --pruneKey)")]
+    public bool Compact { get; set; }
+
     [Option('v', "verbose", Default = 0, Required = false,
         HelpText = "Verbosity level. 0 = Information, 1 = Debug, 2 = Verbose")]
     public int VerboseLevel { get; set; }
@@ -52,10 +70,14 @@ internal class Options
         usage.AppendLine("--log2 <path>             Optional LOG2 transaction log path");
         usage.AppendLine("--no-auto-logs            Disable auto-discovery of <file>.LOG1/.LOG2");
         usage.AppendLine("-r, --recover-deleted     Recover deleted keys/values during parsing");
-        usage.AppendLine("-o, --output <path>       Write corrected hive bytes after log replay");
+        usage.AppendLine("-o, --output <path>       Write corrected/compacted/pruned hive bytes to this path");
         usage.AppendLine("--integrity               Continue on supported corruption conditions");
         usage.AppendLine("--integrityLog <path>     Write corruption details to file");
         usage.AppendLine("--exceeds2GbRecovery      Enable oversized/truncated hive recovery mode");
+        usage.AppendLine("--analyzeBloat            Analyze the hive for abnormal size/bloat and print a report");
+        usage.AppendLine("--pruneKey <path>         Prune subkeys of this key, keeping only --keepRecent most recent (requires -o)");
+        usage.AppendLine("--keepRecent <n>          Number of most-recently-written subkeys to retain under --pruneKey (default 500)");
+        usage.AppendLine("--compact                 Rewrite the hive to -o, dropping deleted/free cells");
         usage.AppendLine("-v, --verbose <0|1|2>     Logging verbosity");
 
         return usage.ToString();
