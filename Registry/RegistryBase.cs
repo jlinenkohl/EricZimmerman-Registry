@@ -52,7 +52,26 @@ public class RegistryBase : IRegistry
 
         binaryReader.BaseStream.Seek(0, SeekOrigin.Begin);
 
-        FileBytes = binaryReader.ReadBytes((int) binaryReader.BaseStream.Length);
+        var streamLength = binaryReader.BaseStream.Length;
+
+        if (streamLength > int.MaxValue)
+        {
+            if (!RegistryParseSettings.Exceeds2GbRecovery)
+            {
+                throw new ArgumentOutOfRangeException(nameof(hivePath),
+                    $"Hive file size (0x{streamLength:X}) exceeds parser byte-array limit (0x{int.MaxValue:X}). Enable Exceeds2GbRecovery to load the maximum supported bytes.");
+            }
+
+            var msg =
+                $"Exceeds2GbRecovery enabled: hive file size is 0x{streamLength:X}, loading first 0x{int.MaxValue:X} bytes due to parser byte-array limit.";
+            Log.Warning(msg);
+            RegistryParseSettings.RecordCorruption(msg);
+            FileBytes = binaryReader.ReadBytes(int.MaxValue);
+        }
+        else
+        {
+            FileBytes = binaryReader.ReadBytes((int) streamLength);
+        }
 
         binaryReader.Close();
         fileStream.Close();

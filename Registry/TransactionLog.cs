@@ -44,7 +44,14 @@ public class TransactionLog
 
         binaryReader.BaseStream.Seek(0, SeekOrigin.Begin);
 
-        FileBytes = binaryReader.ReadBytes((int) binaryReader.BaseStream.Length);
+        var streamLength = binaryReader.BaseStream.Length;
+        if (streamLength > int.MaxValue)
+        {
+            throw new ArgumentOutOfRangeException(nameof(logFile),
+                $"Transaction log file size (0x{streamLength:X}) exceeds parser byte-array limit (0x{int.MaxValue:X}).");
+        }
+
+        FileBytes = binaryReader.ReadBytes((int) streamLength);
         
         var header = ReadBytesFromHive(0, 4096);
 
