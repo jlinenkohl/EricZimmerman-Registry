@@ -27,6 +27,37 @@ internal class Program
 
     private static int Run(Options options)
     {
+        TextWriter originalOut = Console.Out;
+        TextWriter originalError = Console.Error;
+        StreamWriter integrityLogWriter = null;
+
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(options.IntegrityLogPath))
+            {
+                var integrityDir = Path.GetDirectoryName(options.IntegrityLogPath);
+                if (!string.IsNullOrWhiteSpace(integrityDir) && !Directory.Exists(integrityDir))
+                {
+                    Directory.CreateDirectory(integrityDir);
+                }
+
+                integrityLogWriter = new StreamWriter(options.IntegrityLogPath, append: true) { AutoFlush = true };
+                Console.SetOut(new TeeTextWriter(originalOut, integrityLogWriter));
+                Console.SetError(new TeeTextWriter(originalError, integrityLogWriter));
+            }
+
+            return RunCore(options);
+        }
+        finally
+        {
+            Console.SetOut(originalOut);
+            Console.SetError(originalError);
+            integrityLogWriter?.Dispose();
+        }
+    }
+
+    private static int RunCore(Options options)
+    {
         Console.WriteLine(Options.GetUsage());
 
         if (string.IsNullOrWhiteSpace(options.HivePath) || !File.Exists(options.HivePath))
@@ -258,6 +289,22 @@ internal class Program
         Console.WriteLine($"Checksum valid: {hive.Header.ValidateCheckSum()} (header=0x{hive.Header.CheckSum:X8}, calculated=0x{hive.Header.CalculatedChecksum:X8})");
         Console.WriteLine($"Sequence numbers: primary=0x{hive.Header.PrimarySequenceNumber:X8}, secondary=0x{hive.Header.SecondarySequenceNumber:X8}, dirty={hive.Header.PrimarySequenceNumber != hive.Header.SecondarySequenceNumber}");
 
+        var declaredTotalLength = (ulong)hive.Header.Length + 0x1000UL;
+        var loadedLength = (ulong)hive.FileBytes.Length;
+
+        if (declaredTotalLength > loadedLength)
+        {
+            var missingBytes = declaredTotalLength - loadedLength;
+            Console.WriteLine(
+                $"WARNING: This hive declares a total length of 0x{declaredTotalLength:X} bytes, but only 0x{loadedLength:X} bytes were loaded ({missingBytes:N0} bytes / ~{missingBytes / 4096:N0} potential hbins were not read). The statistics below reflect ONLY the loaded portion of the hive and are therefore incomplete.");
+        }
+        else if (loadedLength > declaredTotalLength)
+        {
+            var extraBytes = loadedLength - declaredTotalLength;
+            Console.WriteLine(
+                $"Note: {extraBytes:N0} bytes beyond the hive's declared length (0x{declaredTotalLength:X}) were loaded but are outside the hive itself (e.g. trailing padding/slack space) and are excluded from parsing.");
+        }
+
         hive.RecoverDeleted = recoverDeleted;
         hive.FlushRecordListsAfterParse = false;
 
@@ -290,5 +337,48 @@ internal class Program
             Console.WriteLine($"hard parsing errors (before failure): {hive.HardParsingErrors:N0}");
             Console.WriteLine($"soft parsing errors (before failure): {hive.SoftParsingErrors:N0}");
         }
+    }
+}
+
+/// <summary>
+/// Forwards every write to two underlying TextWriters. Used so that, when --integrityLog is
+/// specified, the full console transcript (stdout/stderr) is mirrored into the integrity log file
+/// alongside the structured corruption entries recorded via RegistryParseSettings.RecordCorruption.
+/// </summary>
+internal sealed class TeeTextWriter : TextWriter
+{
+    private readonly TextWriter _first;
+    private readonly TextWriter _second;
+
+    public TeeTextWriter(TextWriter first, TextWriter second)
+    {
+        _first = first;
+        _second = second;
+    }
+
+    public override System.Text.Encoding Encoding => _first.Encoding;
+
+    public override void Write(char value)
+    {
+        _first.Write(value);
+        _second.Write(value);
+    }
+
+    public override void Write(string value)
+    {
+        _first.Write(value);
+        _second.Write(value);
+    }
+
+    public override void WriteLine(string value)
+    {
+        _first.WriteLine(value);
+        _second.WriteLine(value);
+    }
+
+    public override void Flush()
+    {
+        _first.Flush();
+        _second.Flush();
     }
 }

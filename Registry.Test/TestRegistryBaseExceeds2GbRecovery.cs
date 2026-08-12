@@ -185,4 +185,34 @@ public class TestRegistryBaseExceeds2GbRecovery
 
         Check.That(r.FileBytes.Length).IsEqualTo(0x5000);
     }
+
+    [Test]
+    public void ParseHiveShouldNotThrowAndShouldCapScanWhenDeclaredLengthExceedsLoadedBytes()
+    {
+        // Regression test for a bug tightly coupled to the Exceeds2GbRecovery clamp: RegistryHive.ParseHive
+        // only ever *raised* its internal scan bound (hiveLength) up to FileBytes.Length, never capped it
+        // back down. So when the header's declared length is larger than what was actually loaded (as
+        // happens once a hive is clamped to MaxByteArrayLength), the parser would walk past the end of
+        // FileBytes and hit truncated/empty byte spans, throwing instead of finishing cleanly.
+        var rawBytes = File.ReadAllBytes(@"./Hives/SAM");
+
+        // Declare a hive body length well beyond what actually exists in rawBytes.
+        var declaredLength = (uint)(rawBytes.Length + 0x50000);
+        var declaredLengthBytes = BitConverter.GetBytes(declaredLength);
+        Array.Copy(declaredLengthBytes, 0, rawBytes, 0x28, 4);
+
+        var corruptionLog = Path.Combine(_tempDirectory, "corruption.log");
+        RegistryParseSettings.CorruptionLogPath = corruptionLog;
+        RegistryParseSettings.ContinueOnCorruption = true;
+
+        var hive = new RegistryHive(rawBytes, "SAM_declared_oversize");
+
+        Check.ThatCode(() => hive.ParseHive()).DoesNotThrow();
+
+        // The real hive content should still have been fully parsed despite the bogus declared length.
+        Check.That(hive.CellRecords.Count).IsStrictlyGreaterThan(0);
+
+        Check.That(File.Exists(corruptionLog)).IsTrue();
+        Check.That(File.ReadAllText(corruptionLog)).Contains("declares a total length");
+    }
 }

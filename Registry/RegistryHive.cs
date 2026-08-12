@@ -885,6 +885,21 @@ public class RegistryHive : RegistryBase
             Log.Debug("Header length is smaller than the size of the file.");
             hiveLength = (uint) FileBytes.Length;
         }
+        else if (hiveLength > FileBytes.Length)
+        {
+            // The hive declares more data than is actually available in FileBytes. This happens when
+            // Exceeds2GbRecovery clamped/truncated the loaded bytes below the file's real/declared
+            // size. Parsing must not walk past what was actually loaded: doing so would read
+            // truncated/empty byte spans from ReadBytesFromHive() near the tail and throw. Cap the
+            // scan to the loaded bytes and make the resulting incomplete parse explicit, since it can
+            // otherwise look like a clean, fully-parsed hive when large portions were never read.
+            var missingBytes = (ulong) hiveLength - (ulong) FileBytes.Length;
+            var msg =
+                $"Hive declares a total length of 0x{hiveLength:X} bytes, but only 0x{FileBytes.Length:X} bytes were loaded ({missingBytes:N0} bytes / ~{missingBytes / 4096:N0} potential hbins were not loaded). Parsing is limited to the loaded bytes; results below are incomplete and do not cover the full hive.";
+            Log.Warning(msg);
+            RegistryParseSettings.RecordCorruption(msg);
+            hiveLength = (uint) FileBytes.Length;
+        }
 
         if (Header.PrimarySequenceNumber != Header.SecondarySequenceNumber)
             Log.Warning(
