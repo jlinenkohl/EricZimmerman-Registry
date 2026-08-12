@@ -32,6 +32,8 @@ public class RegistryHive : RegistryBase
     /// </summary>
     public bool FlushRecordListsAfterParse = true;
 
+    private static bool ContinueOnCorruption => RegistryParseSettings.ContinueOnCorruption;
+
     /// <summary>
     ///     Initializes a new instance of the
     ///     <see cref="Registry" />
@@ -115,11 +117,37 @@ public class RegistryHive : RegistryBase
     private DataNode GetDataNodeFromOffset(long relativeOffset)
     {
         var dataLenBytes = ReadBytesFromHive(relativeOffset + 4096, 4);
+        if (dataLenBytes.Length < 4)
+        {
+            var msg = $"Unable to read data node length at relative offset 0x{relativeOffset:X}. Skipping data node";
+            Log.Warning(msg);
+            RegistryParseSettings.ReportCorruption(msg);
+            return null;
+        }
+
         var dataLen = BitConverter.ToUInt32(dataLenBytes, 0);
         var size = (int) dataLen;
         size = Math.Abs(size);
 
-        var dn = new DataNode(ReadBytesFromHive(relativeOffset + 4096, size), relativeOffset);
+        if (size < 4)
+        {
+            var msg = $"Invalid data node size 0x{size:X} at relative offset 0x{relativeOffset:X}. Skipping data node";
+            Log.Warning(msg);
+            RegistryParseSettings.ReportCorruption(msg);
+            return null;
+        }
+
+        var raw = ReadBytesFromHive(relativeOffset + 4096, size);
+        if (raw.Length < 4)
+        {
+            var msg =
+                $"Data node at relative offset 0x{relativeOffset:X} is truncated (0x{raw.Length:X} bytes). Skipping data node";
+            Log.Warning(msg);
+            RegistryParseSettings.ReportCorruption(msg);
+            return null;
+        }
+
+        var dn = new DataNode(raw, relativeOffset);
 
         return dn;
     }
@@ -322,7 +350,7 @@ public class RegistryHive : RegistryBase
     //TODO this needs refactored to remove duplicated code
     private List<RegistryKey> GetSubKeysAndValues(RegistryKey key)
     {
-        _relativeOffsetKeyMap.Add(key.NkRecord.RelativeOffset, key);
+        _relativeOffsetKeyMap[key.NkRecord.RelativeOffset] = key;
 
 
         if (_keyPathKeyMap.ContainsKey(key.KeyPath.ToLowerInvariant()))
@@ -380,14 +408,32 @@ public class RegistryHive : RegistryBase
 
 
             var offsetList = GetDataNodeFromOffset(key.NkRecord.ValueListCellIndex);
+            if (offsetList == null)
+            {
+                var msg =
+                    $"Value list data node is unreadable at relative offset 0x{key.NkRecord.ValueListCellIndex:X}. Key: {key.KeyPath}";
+                Log.Warning(msg);
+                RegistryParseSettings.ReportCorruption(msg);
+                return keys;
+            }
 
             offsetList.IsReferenced = true;
 
             var lastI = 0;
             for (var i = 0; i < key.NkRecord.ValueListCount; i++)
             {
+                var entryOffset = i * 4;
+                if (entryOffset + 4 > offsetList.Data.Length)
+                {
+                    var msg =
+                        $"Value list for key {key.KeyPath} ended unexpectedly at index {i}. Expected count: {key.NkRecord.ValueListCount:N0}";
+                    Log.Warning(msg);
+                    RegistryParseSettings.ReportCorruption(msg);
+                    break;
+                }
+
                 //use i * 4 so we get 4, 8, 12, 16, etc
-                var os = BitConverter.ToUInt32(offsetList.Data, i * 4);
+                var os = BitConverter.ToUInt32(offsetList.Data, entryOffset);
                 //             Logger.Trace("Got value offset 0x{0:X}", os);
                 key.NkRecord.ValueOffsets.Add(os);
                 lastI = i;
@@ -400,6 +446,15 @@ public class RegistryHive : RegistryBase
                 var offsetIndex = lastI * 4; //our starting point
                 while (offsetIndex < offsetList.Data.Length)
                 {
+                    if (offsetIndex + 4 > offsetList.Data.Length)
+                    {
+                        var msg =
+                            $"Trailing value list scan exceeded available bytes for key {key.KeyPath} at offset index {offsetIndex}";
+                        Log.Warning(msg);
+                        RegistryParseSettings.ReportCorruption(msg);
+                        break;
+                    }
+
                     var os = BitConverter.ToUInt32(offsetList.Data, offsetIndex);
 
                     if (os < 8 || os % 8 != 0) break;
@@ -525,7 +580,13 @@ public class RegistryHive : RegistryBase
                 foreach (var offset in riRecord.Offsets)
                 {
                     //           Logger.Trace("In ri, looking for list record at relative offset 0x{0:X}", offset);
-                    var tempList = ListRecords[offset];
+                    if (ListRecords.TryGetValue(offset, out var tempList) == false)
+                    {
+                        var msg = $"RI record referenced missing list at relative offset 0x{offset:X}. Key: {key.KeyPath}";
+                        Log.Warning(msg);
+                        RegistryParseSettings.ReportCorruption(msg);
+                        continue;
+                    }
 
                     //templist is now an li or lh list 
 
@@ -536,7 +597,14 @@ public class RegistryHive : RegistryBase
                         foreach (var offset1 in sk3.Offsets)
                         {
                             //                    Logger.Trace("In ri/li, looking for nk record at relative offset 0x{0:X}", offset1);
-                            var cell = CellRecords[offset1];
+                            if (CellRecords.TryGetValue(offset1, out var cell) == false)
+                            {
+                                var msg =
+                                    $"LI record referenced missing NK at relative offset 0x{offset1:X}. Key: {key.KeyPath}";
+                                Log.Warning(msg);
+                                RegistryParseSettings.ReportCorruption(msg);
+                                continue;
+                            }
 
                             var nk = cell as NkCellRecord;
                             nk.IsReferenced = true;
@@ -558,7 +626,14 @@ public class RegistryHive : RegistryBase
                         {
                             //                  Logger.Trace("In ri/li, looking for nk record at relative offset 0x{0:X}",
                             //            offset3.Key);
-                            var cell = CellRecords[offset3.Key];
+                            if (CellRecords.TryGetValue(offset3.Key, out var cell) == false)
+                            {
+                                var msg =
+                                    $"LF/LH record referenced missing NK at relative offset 0x{offset3.Key:X}. Key: {key.KeyPath}";
+                                Log.Warning(msg);
+                                RegistryParseSettings.ReportCorruption(msg);
+                                continue;
+                            }
 
                             var nk = cell as NkCellRecord;
                             nk.IsReferenced = true;
@@ -581,7 +656,13 @@ public class RegistryHive : RegistryBase
                 foreach (var offset in liRecord.Offsets)
                 {
                     //           Logger.Trace("In li, looking for nk record at relative offset 0x{0:X}", offset);
-                    var cell = CellRecords[offset];
+                    if (CellRecords.TryGetValue(offset, out var cell) == false)
+                    {
+                        var msg = $"LI record referenced missing NK at relative offset 0x{offset:X}. Key: {key.KeyPath}";
+                        Log.Warning(msg);
+                        RegistryParseSettings.ReportCorruption(msg);
+                        continue;
+                    }
 
                     var nk = cell as NkCellRecord;
                     nk.IsReferenced = true;
@@ -858,7 +939,18 @@ public class RegistryHive : RegistryBase
 
     public bool ParseHive()
     {
-        if (_parsed) throw new Exception("ParseHive already called");
+        if (_parsed)
+        {
+            if (!ContinueOnCorruption)
+            {
+                throw new Exception("ParseHive already called");
+            }
+
+            const string msg = "ParseHive already called. ContinueOnCorruption is enabled, so this invocation is skipped";
+            Log.Warning(msg);
+            RegistryParseSettings.ReportCorruption(msg);
+            return false;
+        }
 
         CellRecords = new Dictionary<long, ICellTemplate>();
         ListRecords = new Dictionary<long, IListTemplate>();
@@ -909,16 +1001,19 @@ public class RegistryHive : RegistryBase
 
             if (hbinSig != HbinSignature)
             {
-                Log.Warning(
-                    "hbin header incorrect at absolute offset {OffsetInHive}!!! Percent done: {Percent}",
-                    $"0x{offsetInHive:X}", ((double) offsetInHive / hiveLength).ToString("P"));
+                var msg =
+                    $"hbin header incorrect at absolute offset 0x{offsetInHive:X}. Percent done: {((double) offsetInHive / hiveLength):P}";
+                Log.Warning(msg);
+                RegistryParseSettings.ReportCorruption(msg);
 
-//                    if (RecoverDeleted) //TODO ? always or only if recoverdeleted
-//                    {
-//                        //TODO need to try to recover records from the bad chunk
-//                    }
+                if (!ContinueOnCorruption)
+                {
+                    break;
+                }
 
-                break;
+                offsetInHive += 0x1000;
+                TotalBytesRead += 0x1000;
+                continue;
             }
 
 
@@ -994,7 +1089,20 @@ public class RegistryHive : RegistryBase
                             (f.Flags & NkCellRecord.FlagEnum.HiveEntryRootKey) ==
                             NkCellRecord.FlagEnum.HiveEntryRootKey);
 
-            if (rootNode == null) throw new KeyNotFoundException("Root nk record not found!");
+            if (rootNode == null)
+            {
+                const string msg = "Root nk record not found";
+                Log.Error(msg);
+                RegistryParseSettings.ReportCorruption(msg);
+
+                if (!ContinueOnCorruption)
+                {
+                    throw new KeyNotFoundException(msg);
+                }
+
+                _parsed = true;
+                return false;
+            }
         }
 
         //validate what we found above via the flag method
@@ -1006,7 +1114,24 @@ public class RegistryHive : RegistryBase
         Root = new RegistryKey(rootNode, null);
         Log.Debug("Created root node object. Getting subkeys.");
 
-        var keys = GetSubKeysAndValues(Root);
+        List<RegistryKey> keys;
+        try
+        {
+            keys = GetSubKeysAndValues(Root);
+        }
+        catch (Exception ex)
+        {
+            var msg = $"Error while building subkeys from root at offset 0x{Root.NkRecord.AbsoluteOffset:X}";
+            Log.Error(ex, msg);
+            RegistryParseSettings.ReportCorruption(msg, ex);
+
+            if (!ContinueOnCorruption)
+            {
+                throw;
+            }
+
+            keys = new List<RegistryKey>();
+        }
 
         Root.SubKeys.AddRange(keys);
 

@@ -202,7 +202,18 @@ public class TransactionLog
 
     public bool ParseLog()
     {
-        if (_parsed) throw new Exception("ParseLog already called");
+        if (_parsed)
+        {
+            if (!RegistryParseSettings.ContinueOnCorruption)
+            {
+                throw new Exception("ParseLog already called");
+            }
+
+            const string msg = "ParseLog already called. ContinueOnCorruption is enabled, so this invocation is skipped";
+            Log.Warning(msg);
+            RegistryParseSettings.ReportCorruption(msg);
+            return false;
+        }
 
         var index = 0x200; //data starts at offset 512 decimal
 
@@ -215,12 +226,30 @@ public class TransactionLog
                 break;
 
             var size = BitConverter.ToInt32(FileBytes, index + 4);
+            if (size < 8 || index + size > FileBytes.Length)
+            {
+                var msg =
+                    $"Transaction log entry at offset 0x{index:X} has invalid size 0x{size:X}. Stopping log parse";
+                Log.Warning(msg);
+                RegistryParseSettings.ReportCorruption(msg);
+                break;
+            }
+
             var buff = new byte[size];
 
             Buffer.BlockCopy(FileBytes, index, buff, 0, size);
 
-            var tle = new TransactionLogEntry(buff);
-            TransactionLogEntries.Add(tle);
+            try
+            {
+                var tle = new TransactionLogEntry(buff);
+                TransactionLogEntries.Add(tle);
+            }
+            catch (Exception ex)
+            {
+                var msg = $"Failed to parse transaction log entry at offset 0x{index:X}. Entry skipped";
+                Log.Warning(ex, msg);
+                RegistryParseSettings.ReportCorruption(msg, ex);
+            }
 
             index += size;
         }
@@ -254,9 +283,27 @@ public class TransactionLog
 
             foreach (var dirtyPage in transactionLogEntry.DirtyPages)
             {
-               
+                if (dirtyPage.Offset < 0 || dirtyPage.Size <= 0 || dirtyPage.PageBytes == null)
+                {
+                    var msg =
+                        $"Dirty page has invalid metadata (offset: 0x{dirtyPage.Offset:X}, size: 0x{dirtyPage.Size:X}). Skipping page";
+                    Log.Warning(msg);
+                    RegistryParseSettings.ReportCorruption(msg);
+                    continue;
+                }
 
-                Buffer.BlockCopy(dirtyPage.PageBytes, 0, hiveBytes, dirtyPage.Offset + baseOffset, dirtyPage.Size);
+                var destinationOffset = dirtyPage.Offset + baseOffset;
+                if (destinationOffset < 0 || destinationOffset + dirtyPage.Size > hiveBytes.Length ||
+                    dirtyPage.Size > dirtyPage.PageBytes.Length)
+                {
+                    var msg =
+                        $"Dirty page write exceeds hive bounds (dest: 0x{destinationOffset:X}, size: 0x{dirtyPage.Size:X}, hive len: 0x{hiveBytes.Length:X}). Skipping page";
+                    Log.Warning(msg);
+                    RegistryParseSettings.ReportCorruption(msg);
+                    continue;
+                }
+
+                Buffer.BlockCopy(dirtyPage.PageBytes, 0, hiveBytes, destinationOffset, dirtyPage.Size);
             }
                 
             

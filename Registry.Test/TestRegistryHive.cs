@@ -1260,4 +1260,52 @@ internal class TestRegistryHive
 
         Check.That(m.HasValidHeader).IsTrue();
     }
+
+    [Test]
+    public void ContinueOnCorruptionShouldSkipSecondParseCall()
+    {
+        RegistryParseSettings.ContinueOnCorruption = true;
+
+        try
+        {
+            var sam = new RegistryHive(@".\Hives\SAM");
+            sam.ParseHive();
+
+            var result = sam.ParseHive();
+
+            Check.That(result).IsFalse();
+        }
+        finally
+        {
+            RegistryParseSettings.ContinueOnCorruption = false;
+        }
+    }
+
+    [Test]
+    public void ContinueOnCorruptionShouldWriteVerboseCorruptionLog()
+    {
+        var tempLog = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}.log");
+        RegistryParseSettings.CorruptionLogPath = tempLog;
+        RegistryParseSettings.ContinueOnCorruption = true;
+
+        try
+        {
+            var hive = new RegistryHive(@".\Hives\SAMBadHBinHeader");
+            hive.ParseHive();
+
+            Check.That(File.Exists(tempLog)).IsTrue();
+            Check.That(File.ReadAllText(tempLog)).Contains("hbin header incorrect");
+        }
+        finally
+        {
+            RegistryParseSettings.ContinueOnCorruption = false;
+            RegistryParseSettings.CorruptionLogPath =
+                Path.Combine(Path.GetTempPath(), "registry-corruption-recovery.log");
+
+            if (File.Exists(tempLog))
+            {
+                File.Delete(tempLog);
+            }
+        }
+    }
 }

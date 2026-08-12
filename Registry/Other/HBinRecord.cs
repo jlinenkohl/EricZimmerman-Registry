@@ -122,9 +122,26 @@ public class HBinRecord
 
         while (offsetInHbin < Size)
         {
+            if (offsetInHbin + 4 > _rawBytes.Length)
+            {
+                var msg =
+                    $"Unable to read record size in hbin at absolute offset 0x{AbsoluteOffset + offsetInHbin:X}. Remaining bytes are insufficient";
+                Log.Warning(msg);
+                RegistryParseSettings.ReportCorruption(msg);
+                break;
+            }
+
             var recordSize = BitConverter.ToUInt32(_rawBytes, offsetInHbin);
 
             var readSize = (int) recordSize;
+
+            if (readSize == 0)
+            {
+                var msg = $"Encountered zero-sized cell in hbin at absolute offset 0x{AbsoluteOffset + offsetInHbin:X}. Stopping this hbin";
+                Log.Warning(msg);
+                RegistryParseSettings.ReportCorruption(msg);
+                break;
+            }
 
             if (!_recoverDeleted && readSize > 0)
             {
@@ -135,6 +152,15 @@ public class HBinRecord
 
             // if we get a negative number here the record is allocated, but we cant read negative bytes, so get absolute value
             readSize = Math.Abs(readSize);
+
+            if (offsetInHbin + readSize > _rawBytes.Length)
+            {
+                var msg =
+                    $"Cell size 0x{readSize:X} exceeds remaining hbin bytes at absolute offset 0x{AbsoluteOffset + offsetInHbin:X}. Stopping this hbin";
+                Log.Warning(msg);
+                RegistryParseSettings.ReportCorruption(msg);
+                break;
+            }
 
             //           _registryHive.Logger.Trace(
             //               $"Getting rawRecord at hbin relative offset 0x{offsetInHbin:X} (Absolute offset: 0x{offsetInHbin + RelativeOffset + 0x1000:X}). readsize: {readSize}");

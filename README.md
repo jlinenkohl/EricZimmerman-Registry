@@ -32,6 +32,13 @@ hive.RecoverDeleted = true;
 hive.ParseHive();
 ```
 
+For malformed/corrupted hives where you want best-effort recovery instead of hard exits, enable global corruption continuation before parsing:
+
+```csharp
+RegistryParseSettings.ContinueOnCorruption = true;
+RegistryParseSettings.CorruptionLogPath = @"c:\temp\registry-corruption.log";
+```
+
 There is also a RegistryOnDemand class that forgoes up front processing and only loads things as they are needed via FindKey method. This class can process hives significantly faster than Registry class as it does not handle deleted records and only gets the keys/values for the path specified.
 
 RegistryOnDemand handled several key lookups against a 129MB SOFTWARE hive in less than 2 seconds. The same hive would take approximately 25 seconds to load in Registry.
