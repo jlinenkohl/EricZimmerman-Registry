@@ -10,6 +10,9 @@ namespace Registry;
 
 public class RegistryBase : IRegistry
 {
+    private readonly string _streamBackedPath;
+    private readonly bool _useStreamBackedReads;
+
     public RegistryBase()
     {
         throw new NotSupportedException("Call the other constructor and pass in the path to the Registry hive!");
@@ -19,6 +22,7 @@ public class RegistryBase : IRegistry
     {
         Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
         FileBytes = rawBytes;
+        HiveFileLength = rawBytes.LongLength;
         HivePath = "None";
 
 
@@ -45,15 +49,27 @@ public class RegistryBase : IRegistry
             throw new FileNotFoundException($"The specified file {fullPath} was not found.", fullPath);
         }
 
-        var fileStream = new FileStream(hivePath, FileMode.Open, FileAccess.Read, FileShare.Read);
-        var binaryReader = new BinaryReader(fileStream);
+        using (var fileStream = new FileStream(hivePath, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            HiveFileLength = fileStream.Length;
 
-        binaryReader.BaseStream.Seek(0, SeekOrigin.Begin);
+            if (RegistryParseSettings.Exceeds2GbRecovery && fileStream.Length > int.MaxValue)
+            {
+                _useStreamBackedReads = true;
+                _streamBackedPath = hivePath;
 
-        FileBytes = binaryReader.ReadBytes((int) binaryReader.BaseStream.Length);
-
-        binaryReader.Close();
-        fileStream.Close();
+                var bootstrapLen = (int) Math.Min(4096L, fileStream.Length);
+                FileBytes = new byte[bootstrapLen];
+                fileStream.Seek(0, SeekOrigin.Begin);
+                _ = fileStream.Read(FileBytes, 0, bootstrapLen);
+            }
+            else
+            {
+                var binaryReader = new BinaryReader(fileStream);
+                binaryReader.BaseStream.Seek(0, SeekOrigin.Begin);
+                FileBytes = binaryReader.ReadBytes((int) binaryReader.BaseStream.Length);
+            }
+        }
 
 
         if (!HasValidSignature())
@@ -72,6 +88,7 @@ public class RegistryBase : IRegistry
 
     public long TotalBytesRead { get; internal set; }
     public string Version { get; private set; }
+    public long HiveFileLength { get; protected set; }
 
     public byte[] FileBytes { get; internal set; }
 
@@ -83,6 +100,46 @@ public class RegistryBase : IRegistry
 
     public byte[] ReadBytesFromHive(long offset, int length)
     {
+        if (_useStreamBackedReads)
+        {
+            if (offset < 0 || length <= 0)
+            {
+                return new byte[0];
+            }
+
+            var streamReadLength = Math.Abs(length);
+
+            if (offset >= HiveFileLength)
+            {
+                return new byte[0];
+            }
+
+            var streamRemaining = HiveFileLength - offset;
+            if (streamRemaining <= 0)
+            {
+                return new byte[0];
+            }
+
+            if (streamReadLength > streamRemaining)
+            {
+                streamReadLength = (int) streamRemaining;
+            }
+
+            var result = new byte[streamReadLength];
+
+            using (var fs = new FileStream(_streamBackedPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                fs.Seek(offset, SeekOrigin.Begin);
+                var bytesRead = fs.Read(result, 0, streamReadLength);
+                if (bytesRead < streamReadLength)
+                {
+                    Array.Resize(ref result, bytesRead);
+                }
+            }
+
+            return result;
+        }
+
         var readLength = Math.Abs(length);
 
         var remaining = FileBytes.Length - offset;
@@ -190,8 +247,18 @@ public class RegistryBase : IRegistry
 
     public bool HasValidSignature()
     {
+        if (FileBytes.Length < 4)
+        {
+            return false;
+        }
+
         var sig = BitConverter.ToInt32(FileBytes, 0);
 
         return sig.Equals(RegfSignature);
+    }
+
+    protected internal long HiveLength()
+    {
+        return _useStreamBackedReads ? HiveFileLength : FileBytes.LongLength;
     }
 }

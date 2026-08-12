@@ -39,6 +39,15 @@ RegistryParseSettings.ContinueOnCorruption = true;
 RegistryParseSettings.CorruptionLogPath = @"c:\temp\registry-corruption.log";
 ```
 
+For oversized/truncated recovery workflows where the source hive may exceed normal in-memory assumptions, enable stream-backed recovery mode:
+
+```csharp
+RegistryParseSettings.Exceeds2GbRecovery = true;
+RegistryParseSettings.ContinueOnCorruption = true;
+```
+
+After parsing, inspect `RegistryHive.IntegrityReport` for detected corruption conditions and use `RegistryHive.SanitizeAndRewrite(...)` to emit a normalized hive and optionally reparse/verify it.
+
 There is also a RegistryOnDemand class that forgoes up front processing and only loads things as they are needed via FindKey method. This class can process hives significantly faster than Registry class as it does not handle deleted records and only gets the keys/values for the path specified.
 
 RegistryOnDemand handled several key lookups against a 129MB SOFTWARE hive in less than 2 seconds. The same hive would take approximately 25 seconds to load in Registry.

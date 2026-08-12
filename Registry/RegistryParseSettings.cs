@@ -14,6 +14,11 @@ public static class RegistryParseSettings
     public static bool ContinueOnCorruption { get; set; }
 
     /// <summary>
+    ///     Enables stream-backed recovery parsing for very large/truncated hives that exceed normal in-memory assumptions.
+    /// </summary>
+    public static bool Exceeds2GbRecovery { get; set; }
+
+    /// <summary>
     ///     Destination file for verbose corruption/salvage messages.
     /// </summary>
     public static string CorruptionLogPath { get; set; } =

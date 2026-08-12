@@ -33,6 +33,7 @@ public class RegistryHive : RegistryBase
     public bool FlushRecordListsAfterParse = true;
 
     private static bool ContinueOnCorruption => RegistryParseSettings.ContinueOnCorruption;
+    private static bool Exceeds2GbRecovery => RegistryParseSettings.Exceeds2GbRecovery;
 
     /// <summary>
     ///     Initializes a new instance of the
@@ -75,6 +76,7 @@ public class RegistryHive : RegistryBase
     public Dictionary<long, IListTemplate> ListRecords { get; private set; }
 
     public RegistryKey Root { get; private set; }
+    public ParseIntegrityReport IntegrityReport { get; private set; } = new();
 
     /// <summary>
     ///     The total number of record parsing errors where the records were IsFree == true
@@ -114,6 +116,46 @@ public class RegistryHive : RegistryBase
         }
     }
 
+    private void AddIntegrityIssue(string category, string message, long? absoluteOffset = null, long? relativeOffset = null)
+    {
+        IntegrityReport ??= new ParseIntegrityReport();
+        IntegrityReport.AddIssue(category, message, absoluteOffset, relativeOffset);
+    }
+
+    private bool TryReadUInt32(long offset, out uint value, string context)
+    {
+        var bytes = ReadBytesFromHive(offset, 4);
+        if (bytes.Length < 4)
+        {
+            var msg = $"{context} truncated at absolute offset 0x{offset:X}. Needed 4 bytes, got {bytes.Length}";
+            Log.Warning(msg);
+            RegistryParseSettings.ReportCorruption(msg);
+            AddIntegrityIssue("TruncatedRead", msg, offset);
+            value = 0;
+            return false;
+        }
+
+        value = BitConverter.ToUInt32(bytes, 0);
+        return true;
+    }
+
+    private bool TryReadInt32(long offset, out int value, string context)
+    {
+        var bytes = ReadBytesFromHive(offset, 4);
+        if (bytes.Length < 4)
+        {
+            var msg = $"{context} truncated at absolute offset 0x{offset:X}. Needed 4 bytes, got {bytes.Length}";
+            Log.Warning(msg);
+            RegistryParseSettings.ReportCorruption(msg);
+            AddIntegrityIssue("TruncatedRead", msg, offset);
+            value = 0;
+            return false;
+        }
+
+        value = BitConverter.ToInt32(bytes, 0);
+        return true;
+    }
+
     private DataNode GetDataNodeFromOffset(long relativeOffset)
     {
         var dataLenBytes = ReadBytesFromHive(relativeOffset + 4096, 4);
@@ -122,6 +164,7 @@ public class RegistryHive : RegistryBase
             var msg = $"Unable to read data node length at relative offset 0x{relativeOffset:X}. Skipping data node";
             Log.Warning(msg);
             RegistryParseSettings.ReportCorruption(msg);
+            AddIntegrityIssue("TruncatedDataNode", msg, relativeOffset + 4096, relativeOffset);
             return null;
         }
 
@@ -134,6 +177,7 @@ public class RegistryHive : RegistryBase
             var msg = $"Invalid data node size 0x{size:X} at relative offset 0x{relativeOffset:X}. Skipping data node";
             Log.Warning(msg);
             RegistryParseSettings.ReportCorruption(msg);
+            AddIntegrityIssue("InvalidDataNodeSize", msg, relativeOffset + 4096, relativeOffset);
             return null;
         }
 
@@ -144,6 +188,7 @@ public class RegistryHive : RegistryBase
                 $"Data node at relative offset 0x{relativeOffset:X} is truncated (0x{raw.Length:X} bytes). Skipping data node";
             Log.Warning(msg);
             RegistryParseSettings.ReportCorruption(msg);
+            AddIntegrityIssue("TruncatedDataNode", msg, relativeOffset + 4096, relativeOffset);
             return null;
         }
 
@@ -392,7 +437,28 @@ public class RegistryHive : RegistryBase
         {
             //         Logger.Trace("Getting Class cell information at relative offset 0x{0:X}", key.NkRecord.ClassCellIndex);
             var d = GetDataNodeFromOffset(key.NkRecord.ClassCellIndex);
+            if (d == null)
+            {
+                var msg =
+                    $"Class cell data node unreadable at relative offset 0x{key.NkRecord.ClassCellIndex:X}. Key: {key.KeyPath}";
+                Log.Warning(msg);
+                RegistryParseSettings.ReportCorruption(msg);
+                AddIntegrityIssue("DanglingOffset", msg, key.NkRecord.ClassCellIndex + 4096, key.NkRecord.ClassCellIndex);
+                return keys;
+            }
+
             d.IsReferenced = true;
+            if (key.NkRecord.ClassLength > d.Data.Length)
+            {
+                var msg =
+                    $"Class cell length exceeds available data at relative offset 0x{key.NkRecord.ClassCellIndex:X}. Key: {key.KeyPath}";
+                Log.Warning(msg);
+                RegistryParseSettings.ReportCorruption(msg);
+                AddIntegrityIssue("TruncatedDataNode", msg, key.NkRecord.ClassCellIndex + 4096,
+                    key.NkRecord.ClassCellIndex);
+                return keys;
+            }
+
             var clsName = Encoding.Unicode.GetString(d.Data, 0, key.NkRecord.ClassLength);
             key.ClassName = clsName;
             //         Logger.Trace("Class name found {0}", clsName);
@@ -414,6 +480,8 @@ public class RegistryHive : RegistryBase
                     $"Value list data node is unreadable at relative offset 0x{key.NkRecord.ValueListCellIndex:X}. Key: {key.KeyPath}";
                 Log.Warning(msg);
                 RegistryParseSettings.ReportCorruption(msg);
+                AddIntegrityIssue("DanglingOffset", msg, key.NkRecord.ValueListCellIndex + 4096,
+                    key.NkRecord.ValueListCellIndex);
                 return keys;
             }
 
@@ -452,6 +520,8 @@ public class RegistryHive : RegistryBase
                             $"Trailing value list scan exceeded available bytes for key {key.KeyPath} at offset index {offsetIndex}";
                         Log.Warning(msg);
                         RegistryParseSettings.ReportCorruption(msg);
+                        AddIntegrityIssue("TruncatedValueList", msg, key.NkRecord.ValueListCellIndex + 4096,
+                            key.NkRecord.ValueListCellIndex);
                         break;
                     }
 
@@ -585,6 +655,7 @@ public class RegistryHive : RegistryBase
                         var msg = $"RI record referenced missing list at relative offset 0x{offset:X}. Key: {key.KeyPath}";
                         Log.Warning(msg);
                         RegistryParseSettings.ReportCorruption(msg);
+                        AddIntegrityIssue("DanglingOffset", msg, offset + 4096, offset);
                         continue;
                     }
 
@@ -603,6 +674,7 @@ public class RegistryHive : RegistryBase
                                     $"LI record referenced missing NK at relative offset 0x{offset1:X}. Key: {key.KeyPath}";
                                 Log.Warning(msg);
                                 RegistryParseSettings.ReportCorruption(msg);
+                                AddIntegrityIssue("DanglingOffset", msg, offset1 + 4096, offset1);
                                 continue;
                             }
 
@@ -632,6 +704,7 @@ public class RegistryHive : RegistryBase
                                     $"LF/LH record referenced missing NK at relative offset 0x{offset3.Key:X}. Key: {key.KeyPath}";
                                 Log.Warning(msg);
                                 RegistryParseSettings.ReportCorruption(msg);
+                                AddIntegrityIssue("DanglingOffset", msg, offset3.Key + 4096, offset3.Key);
                                 continue;
                             }
 
@@ -661,6 +734,7 @@ public class RegistryHive : RegistryBase
                         var msg = $"LI record referenced missing NK at relative offset 0x{offset:X}. Key: {key.KeyPath}";
                         Log.Warning(msg);
                         RegistryParseSettings.ReportCorruption(msg);
+                        AddIntegrityIssue("DanglingOffset", msg, offset + 4096, offset);
                         continue;
                     }
 
@@ -681,16 +755,6 @@ public class RegistryHive : RegistryBase
         }
 
         return keys;
-    }
-
-    /// <summary>
-    ///     Returns the length, in bytes, of the file being processed
-    ///     <remarks>This is the length returned by the underlying stream used to open the file</remarks>
-    /// </summary>
-    /// <returns></returns>
-    protected internal int HiveLength()
-    {
-        return FileBytes.Length;
     }
 
     /// <summary>
@@ -954,6 +1018,7 @@ public class RegistryHive : RegistryBase
 
         CellRecords = new Dictionary<long, ICellTemplate>();
         ListRecords = new Dictionary<long, IListTemplate>();
+        IntegrityReport = new ParseIntegrityReport();
 
         DeletedRegistryKeys = new List<RegistryKey>();
         UnassociatedRegistryValues = new List<KeyValue>();
@@ -971,11 +1036,25 @@ public class RegistryHive : RegistryBase
         ////Look at first hbin, get its size, then read that many bytes to create hbin record
         long offsetInHive = 4096;
 
-        var hiveLength = Header.Length + 0x1000;
-        if (hiveLength < FileBytes.Length)
+        var actualHiveLength = HiveLength();
+        long hiveLength = Header.Length + 0x1000L;
+
+        if (hiveLength < actualHiveLength)
         {
-            Log.Debug("Header length is smaller than the size of the file.");
-            hiveLength = (uint) FileBytes.Length;
+            var msg = "Header length is smaller than the size of the file.";
+            Log.Debug(msg);
+            AddIntegrityIssue("HeaderLengthMismatch", msg);
+            hiveLength = actualHiveLength;
+        }
+
+        if (Exceeds2GbRecovery && hiveLength > actualHiveLength)
+        {
+            var msg =
+                $"Header length exceeds actual file length. Header-based end: 0x{hiveLength:X}, actual: 0x{actualHiveLength:X}. Capping traversal to file length";
+            Log.Warning(msg);
+            RegistryParseSettings.ReportCorruption(msg);
+            AddIntegrityIssue("HeaderLengthMismatch", msg);
+            hiveLength = actualHiveLength;
         }
 
         if (Header.PrimarySequenceNumber != Header.SecondarySequenceNumber)
@@ -985,7 +1064,10 @@ public class RegistryHive : RegistryBase
         //keep reading the file until we reach the end
         while (offsetInHive < hiveLength)
         {
-            var hbinSize = BitConverter.ToUInt32(ReadBytesFromHive(offsetInHive + 8, 4), 0);
+            if (!TryReadUInt32(offsetInHive + 8, out var hbinSize, "hbin size"))
+            {
+                break;
+            }
 
             if (hbinSize == 0)
             {
@@ -997,7 +1079,27 @@ public class RegistryHive : RegistryBase
                 continue;
             }
 
-            var hbinSig = BitConverter.ToInt32(ReadBytesFromHive(offsetInHive, 4), 0);
+            if (hbinSize < 0x20 || hbinSize % 8 != 0)
+            {
+                var msg = $"Implausible hbin size 0x{hbinSize:X} found at absolute offset 0x{offsetInHive:X}";
+                Log.Warning(msg);
+                RegistryParseSettings.ReportCorruption(msg);
+                AddIntegrityIssue("InvalidHbinSize", msg, offsetInHive);
+
+                if (!ContinueOnCorruption && !Exceeds2GbRecovery)
+                {
+                    break;
+                }
+
+                offsetInHive += 0x1000;
+                TotalBytesRead += 0x1000;
+                continue;
+            }
+
+            if (!TryReadInt32(offsetInHive, out var hbinSig, "hbin signature"))
+            {
+                break;
+            }
 
             if (hbinSig != HbinSignature)
             {
@@ -1005,8 +1107,9 @@ public class RegistryHive : RegistryBase
                     $"hbin header incorrect at absolute offset 0x{offsetInHive:X}. Percent done: {((double) offsetInHive / hiveLength):P}";
                 Log.Warning(msg);
                 RegistryParseSettings.ReportCorruption(msg);
+                AddIntegrityIssue("InvalidHbinSignature", msg, offsetInHive);
 
-                if (!ContinueOnCorruption)
+                if (!ContinueOnCorruption && !Exceeds2GbRecovery)
                 {
                     break;
                 }
@@ -1020,7 +1123,38 @@ public class RegistryHive : RegistryBase
             //        Logger.Trace(
             //              $"Processing hbin at absolute offset 0x{offsetInHive:X} with size 0x{hbinSize:X} Percent done: {(double) offsetInHive / hiveLength:P}");
 
+            if (offsetInHive + hbinSize > actualHiveLength)
+            {
+                var msg =
+                    $"hbin at absolute offset 0x{offsetInHive:X} extends past EOF. Expected end: 0x{offsetInHive + hbinSize:X}, EOF: 0x{actualHiveLength:X}";
+                Log.Warning(msg);
+                RegistryParseSettings.ReportCorruption(msg);
+                AddIntegrityIssue("TruncatedHbin", msg, offsetInHive);
+
+                if (Exceeds2GbRecovery)
+                {
+                    hbinSize = (uint) Math.Max(0, actualHiveLength - offsetInHive);
+                    if (hbinSize < 0x20)
+                    {
+                        break;
+                    }
+                }
+                else
+                {
+                    break;
+                }
+            }
+
             var rawhbin = ReadBytesFromHive(offsetInHive, (int) hbinSize);
+            if (rawhbin.Length < 0x20)
+            {
+                var msg =
+                    $"Unable to read minimum hbin header bytes at absolute offset 0x{offsetInHive:X}. Read 0x{rawhbin.Length:X} bytes";
+                Log.Warning(msg);
+                RegistryParseSettings.ReportCorruption(msg);
+                AddIntegrityIssue("TruncatedHbin", msg, offsetInHive);
+                break;
+            }
 
             try
             {
@@ -1060,11 +1194,19 @@ public class RegistryHive : RegistryBase
                     }
 
                 HBinRecordCount += 1;
-                HBinRecordTotalSize += hbinSize;
+                if (uint.MaxValue - HBinRecordTotalSize < hbinSize)
+                {
+                    HBinRecordTotalSize = uint.MaxValue;
+                }
+                else
+                {
+                    HBinRecordTotalSize += hbinSize;
+                }
             }
             catch (Exception ex)
             {
                 Log.Error(ex, "Error processing hbin at absolute offset {OffsetInHive}", $"0x{offsetInHive:X}");
+                AddIntegrityIssue("HbinParseError", ex.Message, offsetInHive);
             }
 
             offsetInHive += hbinSize;
@@ -1080,8 +1222,10 @@ public class RegistryHive : RegistryBase
 
         if (rootNode == null)
         {
-            Log.Warning(
-                "Unable to find root key based on flag HiveEntryRootKey. Looking for root key via Header.RootCellOffset value...");
+            const string fallbackMsg =
+                "Unable to find root key based on Header.RootCellOffset. Looking for root key via HiveEntryRootKey flag...";
+            Log.Warning(fallbackMsg);
+            AddIntegrityIssue("RootFallback", fallbackMsg, Header.RootCellOffset + 4096, Header.RootCellOffset);
             rootNode =
                 CellRecords.Values.OfType<NkCellRecord>()
                     .FirstOrDefault(
@@ -1094,6 +1238,7 @@ public class RegistryHive : RegistryBase
                 const string msg = "Root nk record not found";
                 Log.Error(msg);
                 RegistryParseSettings.ReportCorruption(msg);
+                AddIntegrityIssue("RootMissing", msg);
 
                 if (!ContinueOnCorruption)
                 {
@@ -1124,6 +1269,7 @@ public class RegistryHive : RegistryBase
             var msg = $"Error while building subkeys from root at offset 0x{Root.NkRecord.AbsoluteOffset:X}";
             Log.Error(ex, msg);
             RegistryParseSettings.ReportCorruption(msg, ex);
+            AddIntegrityIssue("SubkeyBuildError", msg, Root.NkRecord.AbsoluteOffset, Root.NkRecord.RelativeOffset);
 
             if (!ContinueOnCorruption)
             {
@@ -1140,13 +1286,20 @@ public class RegistryHive : RegistryBase
         //All processing is complete, so we do some tests to see if we really saw everything
         if (RecoverDeleted && HiveLength() != TotalBytesRead)
         {
-            var remainingHive = ReadBytesFromHive(TotalBytesRead, (int) (HiveLength() - TotalBytesRead));
+            var remainingByteCount = HiveLength() - TotalBytesRead;
+            var remainingHive = remainingByteCount > 0
+                ? ReadBytesFromHive(TotalBytesRead, (int) Math.Min(int.MaxValue, remainingByteCount))
+                : new byte[0];
 
             //Sometimes the remainder of the file is all zeros, which is useless, so check for that
             if (!Array.TrueForAll(remainingHive, a => a == 0))
+            {
                 Log.Warning(
                     "Extra, non-zero data found beyond hive length! Check for erroneous data starting at {BytesRead}!",
                     $"0x{TotalBytesRead:X}");
+                AddIntegrityIssue("ExtraTrailingData",
+                    $"Extra non-zero data found beyond bytes read starting at 0x{TotalBytesRead:X}", TotalBytesRead);
+            }
 
             //as a second check, compare Header length with what we read (taking the header into account as Header.Length is only for hbin records)
 
@@ -1506,19 +1659,93 @@ public class RegistryHive : RegistryBase
         hiveMetadata.HasValidHeader = true;
 
         long offset = 4096;
+        var maxOffset = Math.Min(HiveLength(), Header.Length + 0x1000L);
 
-        while (offset < Header.Length)
+        while (offset < maxOffset)
         {
-            var hbinSig = BitConverter.ToUInt32(ReadBytesFromHive(offset, 4), 0);
+            if (!TryReadUInt32(offset, out var hbinSig, "verify hbin signature"))
+            {
+                hiveMetadata.HasValidHeader = false;
+                break;
+            }
 
             if (hbinSig == HbinSignature) hiveMetadata.NumberofHBins += 1;
+            else hiveMetadata.HasValidHeader = false;
 
-            var hbinSize = BitConverter.ToUInt32(ReadBytesFromHive(offset + 8, 4), 0);
+            if (!TryReadUInt32(offset + 8, out var hbinSize, "verify hbin size"))
+            {
+                hiveMetadata.HasValidHeader = false;
+                break;
+            }
+
+            if (hbinSize < 0x20)
+            {
+                hiveMetadata.HasValidHeader = false;
+                var msg = $"Verify detected invalid hbin size 0x{hbinSize:X} at absolute offset 0x{offset:X}";
+                AddIntegrityIssue("InvalidHbinSize", msg, offset);
+                break;
+            }
 
             offset += hbinSize;
         }
 
         return hiveMetadata;
+    }
+
+    public RecoverySanitizationResult SanitizeAndRewrite(string outputHivePath, bool validateOutput = true)
+    {
+        if (string.IsNullOrWhiteSpace(outputHivePath))
+        {
+            throw new ArgumentException("Output hive path is required", nameof(outputHivePath));
+        }
+
+        if (!_parsed)
+        {
+            ParseHive();
+        }
+
+        if (Root == null)
+        {
+            throw new InvalidOperationException("Hive did not parse to a usable root key");
+        }
+
+        var skeleton = new RegistrySkeleton(this);
+        var added = skeleton.AddEntry(new SkeletonKeyRoot(Root.KeyPath, true, true));
+        if (!added)
+        {
+            throw new InvalidOperationException("Unable to add root key to skeleton for sanitize/rewrite");
+        }
+
+        skeleton.Write(outputHivePath);
+
+        var result = new RecoverySanitizationResult
+        {
+            OutputPath = outputHivePath,
+            IntegrityIssueCount = IntegrityReport?.IssueCount ?? 0
+        };
+
+        if (!validateOutput)
+        {
+            return result;
+        }
+
+        var reparsed = new RegistryHive(outputHivePath)
+        {
+            RecoverDeleted = RecoverDeleted,
+            FlushRecordListsAfterParse = false
+        };
+
+        result.ParseSucceeded = reparsed.ParseHive();
+        var metadata = reparsed.Verify();
+        result.VerifyPassed = metadata.HasValidHeader;
+        result.ParsedHbinCount = metadata.NumberofHBins;
+
+        if (!result.VerifyPassed)
+        {
+            result.Notes.Add("Reparsed sanitized hive did not pass Verify().");
+        }
+
+        return result;
     }
 
     public IEnumerable<ValueBySizeInfo> FindByValueSize(int minimumSizeInBytes)

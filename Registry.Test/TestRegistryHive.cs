@@ -1308,4 +1308,53 @@ internal class TestRegistryHive
             }
         }
     }
+
+    [Test]
+    public void Exceeds2GbRecoveryShouldCaptureIntegrityIssues()
+    {
+        RegistryParseSettings.Exceeds2GbRecovery = true;
+        RegistryParseSettings.ContinueOnCorruption = false;
+
+        try
+        {
+            var hive = new RegistryHive(@".\Hives\SAMBadHBinHeader");
+            hive.ParseHive();
+
+            Check.That(hive.IntegrityReport).IsNotNull();
+            Check.That(hive.IntegrityReport.IssueCount).IsStrictlyGreaterThan(0);
+            Check.That(hive.IntegrityReport.Issues.Any(t => t.Category == "InvalidHbinSignature")).IsTrue();
+        }
+        finally
+        {
+            RegistryParseSettings.Exceeds2GbRecovery = false;
+            RegistryParseSettings.ContinueOnCorruption = false;
+        }
+    }
+
+    [Test]
+    public void SanitizeAndRewriteShouldProduceVerifiableHive()
+    {
+        var output = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}.hve");
+
+        try
+        {
+            var hive = new RegistryHive(@".\Hives\SAM");
+            hive.FlushRecordListsAfterParse = false;
+            hive.ParseHive();
+
+            var result = hive.SanitizeAndRewrite(output, true);
+
+            Check.That(File.Exists(output)).IsTrue();
+            Check.That(result.ParseSucceeded).IsTrue();
+            Check.That(result.VerifyPassed).IsTrue();
+            Check.That(result.ParsedHbinCount).IsStrictlyGreaterThan(0);
+        }
+        finally
+        {
+            if (File.Exists(output))
+            {
+                File.Delete(output);
+            }
+        }
+    }
 }
