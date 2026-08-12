@@ -909,14 +909,21 @@ public class RegistryHive : RegistryBase
 
             if (hbinSig != HbinSignature)
             {
-                Log.Warning(
-                    "hbin header incorrect at absolute offset {OffsetInHive}!!! Percent done: {Percent}",
-                    $"0x{offsetInHive:X}", ((double) offsetInHive / hiveLength).ToString("P"));
+                var corruptionMessage =
+                    $"hbin header incorrect at absolute offset 0x{offsetInHive:X} (Percent done: {((double)offsetInHive / hiveLength):P})";
+                Log.Warning(corruptionMessage);
+                RegistryParseSettings.RecordCorruption(corruptionMessage);
 
 //                    if (RecoverDeleted) //TODO ? always or only if recoverdeleted
 //                    {
 //                        //TODO need to try to recover records from the bad chunk
 //                    }
+                if (RegistryParseSettings.ContinueOnCorruption)
+                {
+                    offsetInHive += 4096;
+                    TotalBytesRead += 4096;
+                    continue;
+                }
 
                 break;
             }
@@ -994,7 +1001,20 @@ public class RegistryHive : RegistryBase
                             (f.Flags & NkCellRecord.FlagEnum.HiveEntryRootKey) ==
                             NkCellRecord.FlagEnum.HiveEntryRootKey);
 
-            if (rootNode == null) throw new KeyNotFoundException("Root nk record not found!");
+            if (rootNode == null)
+            {
+                const string rootError = "Root nk record not found!";
+                RegistryParseSettings.RecordCorruption(rootError);
+
+                if (!RegistryParseSettings.ContinueOnCorruption)
+                {
+                    throw new KeyNotFoundException(rootError);
+                }
+
+                Log.Warning(rootError);
+                _parsed = true;
+                return false;
+            }
         }
 
         //validate what we found above via the flag method

@@ -29,6 +29,8 @@ public class RegistryBase : IRegistry
             throw new ArgumentException("Data in byte array is not a Registry hive (bad signature)");
         }
 
+        ApplyExceeds2GbRecoveryPadding();
+
         HivePath = hivePath;
 
         Initialize();
@@ -62,6 +64,8 @@ public class RegistryBase : IRegistry
 
             throw new Exception($"{hivePath} is not a Registry hive (bad signature)");
         }
+
+        ApplyExceeds2GbRecoveryPadding();
 
         HivePath = hivePath;
 
@@ -193,5 +197,40 @@ public class RegistryBase : IRegistry
         var sig = BitConverter.ToInt32(FileBytes, 0);
 
         return sig.Equals(RegfSignature);
+    }
+
+    private void ApplyExceeds2GbRecoveryPadding()
+    {
+        if (!RegistryParseSettings.Exceeds2GbRecovery || FileBytes.Length < 0x2c)
+        {
+            return;
+        }
+
+        var declaredHiveLength = BitConverter.ToUInt32(FileBytes, 0x28);
+        var declaredFileLength = declaredHiveLength + 0x1000UL;
+
+        if (declaredFileLength <= (ulong)FileBytes.Length)
+        {
+            return;
+        }
+
+        if (declaredFileLength > int.MaxValue)
+        {
+            var msg =
+                $"Exceeds2GbRecovery was enabled, but declared hive size (0x{declaredFileLength:X}) exceeds byte-array parser limit.";
+            Log.Warning(msg);
+            RegistryParseSettings.RecordCorruption(msg);
+            return;
+        }
+
+        var originalLength = FileBytes.Length;
+        var local = FileBytes;
+        Array.Resize(ref local, (int)declaredFileLength);
+        FileBytes = local;
+
+        var resizeMessage =
+            $"Exceeds2GbRecovery padded hive bytes from 0x{(ulong)originalLength:X} to declared length 0x{declaredFileLength:X}.";
+        Log.Warning(resizeMessage);
+        RegistryParseSettings.RecordCorruption(resizeMessage);
     }
 }

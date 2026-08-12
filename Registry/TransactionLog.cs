@@ -52,7 +52,7 @@ public class TransactionLog
         
         if (h.Length > FileBytes.Length)
         {
-            var diff = Header.Length - FileBytes.Length;
+            var diff = h.Length - FileBytes.Length;
             //we need to add some bytes so the size is the same
             Log.Debug("Log size exceeds hive size. Adding {Diff} bytes to hive bytes",diff);
 

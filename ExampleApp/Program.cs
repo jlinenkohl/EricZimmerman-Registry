@@ -36,6 +36,7 @@ internal class Program
         }
 
         ConfigureLogging(options.VerboseLevel);
+        ConfigureParseSettings(options);
 
         var discoveredLogs = ResolveLogPaths(options).ToList();
         foreach (var logFile in discoveredLogs)
@@ -65,7 +66,14 @@ internal class Program
         {
             if (discoveredLogs.Count == 0)
             {
-                Console.WriteLine("Hive is dirty but no transaction logs were supplied or discovered.");
+                if (!options.Integrity && !options.Exceeds2GbRecovery)
+                {
+                    Console.WriteLine("Hive is dirty but no transaction logs were supplied or discovered.");
+                }
+                else
+                {
+                    Console.WriteLine("Hive is dirty and no transaction logs were supplied or discovered. Continuing due to integrity/recovery mode.");
+                }
             }
             else
             {
@@ -155,6 +163,24 @@ internal class Program
             .MinimumLevel.Is(minimumLevel)
             .WriteTo.Console()
             .CreateLogger();
+    }
+
+    private static void ConfigureParseSettings(Options options)
+    {
+        RegistryParseSettings.ContinueOnCorruption = options.Integrity || options.Exceeds2GbRecovery;
+        RegistryParseSettings.Exceeds2GbRecovery = options.Exceeds2GbRecovery;
+        RegistryParseSettings.CorruptionLogPath = options.IntegrityLogPath;
+
+        if (RegistryParseSettings.ContinueOnCorruption)
+        {
+            Console.WriteLine(
+                $"Integrity parsing enabled. ContinueOnCorruption={RegistryParseSettings.ContinueOnCorruption}, Exceeds2GbRecovery={RegistryParseSettings.Exceeds2GbRecovery}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(RegistryParseSettings.CorruptionLogPath))
+        {
+            Console.WriteLine($"Corruption details will be written to: {RegistryParseSettings.CorruptionLogPath}");
+        }
     }
 
     private static IEnumerable<string> ResolveLogPaths(Options options)
