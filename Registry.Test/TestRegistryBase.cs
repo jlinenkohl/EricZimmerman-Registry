@@ -80,16 +80,16 @@ public class TestRegistryBase
     [Test]
     public void OversizedHiveWithoutRecoveryShouldThrowArgumentOutOfRangeException()
     {
-        Check.ThatCode(() => { RegistryBase.GetByteCountToRead((long)int.MaxValue + 1, false, "hivePath"); })
+        Check.ThatCode(() => { RegistryBase.GetByteCountToRead((long)RegistryBase.MaxByteArrayLength + 1, false, "hivePath"); })
             .Throws<ArgumentOutOfRangeException>();
     }
 
     [Test]
-    public void OversizedHiveWithRecoveryShouldClampReadLengthToIntMaxValue()
+    public void OversizedHiveWithRecoveryShouldClampReadLengthToMaxByteArrayLength()
     {
-        var count = RegistryBase.GetByteCountToRead((long)int.MaxValue + 1, true, "hivePath");
+        var count = RegistryBase.GetByteCountToRead((long)RegistryBase.MaxByteArrayLength + 1, true, "hivePath");
 
-        Check.That(count).IsEqualTo(int.MaxValue);
+        Check.That(count).IsEqualTo(RegistryBase.MaxByteArrayLength);
     }
 
     [Test]

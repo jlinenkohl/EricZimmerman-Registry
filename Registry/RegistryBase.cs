@@ -10,6 +10,14 @@ namespace Registry;
 
 public class RegistryBase : IRegistry
 {
+    /// <summary>
+    /// The CLR's actual maximum single-dimension array length (0x7FFFFFC7), which is 88 elements
+    /// smaller than int.MaxValue (0x7FFFFFFF). Allocating a byte[] any larger than this throws
+    /// "Array dimensions exceeded supported range", so this is the true cap to use instead of
+    /// int.MaxValue when sizing FileBytes.
+    /// </summary>
+    internal const int MaxByteArrayLength = 0x7FFFFFC7;
+
     public RegistryBase()
     {
         throw new NotSupportedException("Call the other constructor and pass in the path to the Registry hive!");
@@ -55,10 +63,10 @@ public class RegistryBase : IRegistry
         var streamLength = binaryReader.BaseStream.Length;
         var byteCountToRead = GetByteCountToRead(streamLength, RegistryParseSettings.Exceeds2GbRecovery, hivePath);
 
-        if (byteCountToRead == int.MaxValue && streamLength > int.MaxValue)
+        if (byteCountToRead == MaxByteArrayLength && streamLength > MaxByteArrayLength)
         {
             var msg =
-                $"Exceeds2GbRecovery enabled: hive file size is 0x{streamLength:X}, loading first 0x{int.MaxValue:X} bytes due to parser byte-array limit.";
+                $"Exceeds2GbRecovery enabled: hive file size is 0x{streamLength:X}, loading first 0x{MaxByteArrayLength:X} bytes due to parser byte-array limit.";
             Log.Warning(msg);
             RegistryParseSettings.RecordCorruption(msg);
         }
@@ -225,7 +233,7 @@ public class RegistryBase : IRegistry
             return;
         }
 
-        if (declaredFileLength > int.MaxValue)
+        if (declaredFileLength > MaxByteArrayLength)
         {
             var msg =
                 $"Exceeds2GbRecovery was enabled, but declared hive size (0x{declaredFileLength:X}) exceeds byte-array parser limit.";
@@ -247,7 +255,7 @@ public class RegistryBase : IRegistry
 
     internal static int GetByteCountToRead(long streamLength, bool exceeds2GbRecovery, string hivePath)
     {
-        if (streamLength <= int.MaxValue)
+        if (streamLength <= MaxByteArrayLength)
         {
             return (int)streamLength;
         }
@@ -255,9 +263,9 @@ public class RegistryBase : IRegistry
         if (!exceeds2GbRecovery)
         {
             throw new ArgumentOutOfRangeException(nameof(hivePath),
-                $"Hive file size (0x{streamLength:X}) exceeds parser byte-array limit (0x{int.MaxValue:X}). Enable Exceeds2GbRecovery to load the maximum supported bytes.");
+                $"Hive file size (0x{streamLength:X}) exceeds parser byte-array limit (0x{MaxByteArrayLength:X}). Enable Exceeds2GbRecovery to load the maximum supported bytes.");
         }
 
-        return int.MaxValue;
+        return MaxByteArrayLength;
     }
 }
