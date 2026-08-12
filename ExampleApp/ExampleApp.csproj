@@ -2,6 +2,7 @@
 
     <PropertyGroup>
         <TargetFramework>net462</TargetFramework>
+        <OutputType>Exe</OutputType>
         <IsPackable>false</IsPackable>
     </PropertyGroup>
 

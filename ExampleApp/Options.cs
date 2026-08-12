@@ -1,56 +1,48 @@
-﻿using System.Text;
+using System.Text;
 using CommandLine;
 
 internal class Options
 {
-    [Option('f', "file", Required = false,
-        HelpText = "Name of registry hive to process")]
-    public string HiveName { get; set; }
+    [Option('f', "file", Required = true,
+        HelpText = "Path to the registry hive to analyze")]
+    public string HivePath { get; set; }
 
-    [Option('d', "directory", Required = false,
-        HelpText = "Name of directory to lok for registry hives to process")]
-    public string DirectoryName { get; set; }
+    [Option("log1", Required = false,
+        HelpText = "Path to LOG1 transaction log")]
+    public string Log1Path { get; set; }
 
-    [Option('e', Default = false, Required = false,
-        HelpText = "If true, export a file that can be compared to other Registry parsers")]
-    public bool ExportHiveData { get; set; }
+    [Option("log2", Required = false,
+        HelpText = "Path to LOG2 transaction log")]
+    public string Log2Path { get; set; }
 
-    [Option('p', Default = false, Required = false,
-        HelpText = "If true, pause after processing a hive and wait for keypress to continue")]
-    public bool PauseAfterEachFile { get; set; }
+    [Option("no-auto-logs", Default = false, Required = false,
+        HelpText = "Disable automatic discovery of adjacent .LOG1/.LOG2 files")]
+    public bool DisableAutoLogs { get; set; }
 
-    [Option('a', Default = false, Required = false,
-        HelpText = "If true, only recovered deleted keys/values will be exported")]
-    public bool ExportDeletedOnly { get; set; }
-
-    [Option('r', Default = false, Required = false,
-        HelpText = "If true, recover and process deleted Registry keys/values")]
+    [Option('r', "recover-deleted", Default = false, Required = false,
+        HelpText = "Recover and process deleted Registry keys/values")]
     public bool RecoverDeleted { get; set; }
 
-    [Option('v', Default = 0, Required = false,
-        HelpText = "Verbosity level. 0 = Info, 1 = Debug, 2 = Trace")]
+    [Option('o', "output", Required = false,
+        HelpText = "Path to write corrected hive bytes after transaction log replay")]
+    public string OutputPath { get; set; }
+
+    [Option('v', "verbose", Default = 0, Required = false,
+        HelpText = "Verbosity level. 0 = Information, 1 = Debug, 2 = Verbose")]
     public int VerboseLevel { get; set; }
 
-    [Option('y', Default = false, Required = false,
-        HelpText = "If false, lists containing cell record and lists will be flushed at the end of parsing")]
-    public bool DontFlushLists { get; set; }
-
-    public string GetUsage()
+    public static string GetUsage()
     {
         var usage = new StringBuilder();
-        usage.AppendLine("Registry example app help");
-        usage.AppendLine("-d <directory>: Process files found in <directory>");
-        usage.AppendLine("-f <file>: Process <file>");
-        usage.AppendLine("-p: Pause after processing each file");
-        usage.AppendLine("-r: Recover and process deleted Registry keys/values");
-        usage.AppendLine("-v: Verbosity level. 0 = Info, 1 = Debug, 2 = Trace");
-        usage.AppendLine("-y: Flush lists containing cell and list records");
-        usage.AppendLine(
-            "-e: If present, export a file that can be compared to other Registry parsers to same directory as hive is found in");
-        usage.AppendLine("-a: Only export deleted key/values");
+        usage.AppendLine("Registry integrity/recovery analyzer");
+        usage.AppendLine("-f, --file <path>         Registry hive to analyze");
+        usage.AppendLine("--log1 <path>             Optional LOG1 transaction log path");
+        usage.AppendLine("--log2 <path>             Optional LOG2 transaction log path");
+        usage.AppendLine("--no-auto-logs            Disable auto-discovery of <file>.LOG1/.LOG2");
+        usage.AppendLine("-r, --recover-deleted     Recover deleted keys/values during parsing");
+        usage.AppendLine("-o, --output <path>       Write corrected hive bytes after log replay");
+        usage.AppendLine("-v, --verbose <0|1|2>     Logging verbosity");
 
-        usage.AppendLine("");
-        usage.AppendLine("-d or -f must be specified, but not both");
         return usage.ToString();
     }
 }
