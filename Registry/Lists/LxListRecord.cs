@@ -12,6 +12,7 @@ public class LxListRecord : IListTemplate, IRecordBase
 {
     // private fields...
     private readonly int _size;
+    private Dictionary<uint, string> _offsets;
 
     // public constructors...
     /// <summary>
@@ -36,6 +37,8 @@ public class LxListRecord : IListTemplate, IRecordBase
     {
         get
         {
+            if (_offsets != null) return _offsets;
+
             var offsets = new Dictionary<uint, string>();
 
             var index = 0x8;
@@ -67,7 +70,13 @@ public class LxListRecord : IListTemplate, IRecordBase
                 counter += 1;
             }
 
-            return offsets;
+            // Parsing this list is O(NumberOfEntries) and was previously redone on every single property
+            // access. During tree-walking of large hives this property can be read many times per list
+            // record, so caching the parsed result avoids that repeated (and otherwise cumulatively
+            // significant) re-parsing cost.
+            _offsets = offsets;
+
+            return _offsets;
         }
     }
 

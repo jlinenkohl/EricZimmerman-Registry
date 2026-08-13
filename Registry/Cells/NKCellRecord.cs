@@ -61,6 +61,7 @@ public class NkCellRecord : ICellTemplate, IRecordBase
 
     private readonly int _rawBytesLength;
     private readonly IRegistry _registryHive;
+    private byte[] _rawBytes;
 
     // public fields...
     public List<ulong> ValueOffsets;
@@ -309,8 +310,22 @@ public class NkCellRecord : ICellTemplate, IRecordBase
     {
         get
         {
-            var raw = _registryHive.ReadBytesFromHive(AbsoluteOffset, _rawBytesLength);
-            return raw;
+            if (_rawBytes == null)
+            {
+                // Every property access on this record (Name, Flags, ValueListCellIndex,
+                // SubkeyListsStableCellIndex, etc.) reads through RawBytes. Previously this re-read and
+                // re-copied the bytes from the underlying hive's FileBytes array on every single access,
+                // which made parsing large hives (hundreds of thousands to millions of NK records, each with
+                // dozens of property reads) extremely slow due to redundant array allocations/copies.
+                // Caching the underlying bytes here means they only need to be fetched from the hive once
+                // per record. Callers such as RegistrySkeleton intentionally mutate the array returned by
+                // this property in place (e.g. zeroing out value counts/offsets before writing), so we must
+                // still hand back a fresh copy on each access rather than the cached array directly,
+                // otherwise those mutations would corrupt the cached bytes for subsequent reads.
+                _rawBytes = _registryHive.ReadBytesFromHive(AbsoluteOffset, _rawBytesLength);
+            }
+
+            return (byte[]) _rawBytes.Clone();
         }
     }
 

@@ -28,6 +28,16 @@ public class RegistryHive : RegistryBase
     private Dictionary<long, RegistryKey> _relativeOffsetKeyMap = new();
 
     /// <summary>
+    ///     Number of keys processed so far by GetSubKeysAndValues during ParseHive(). Exposed so callers can
+    ///     poll it (e.g. from another thread) to observe parse progress on very large hives, where the tree
+    ///     walk can take a long time and would otherwise appear to hang.
+    /// </summary>
+    public long KeysProcessed;
+
+    private const int ProgressLogIntervalKeys = 10_000;
+    private System.Diagnostics.Stopwatch _progressStopwatch;
+
+    /// <summary>
     ///     If true, CellRecords and ListRecords will be purged to free memory
     /// </summary>
     public bool FlushRecordListsAfterParse = true;
@@ -323,6 +333,16 @@ public class RegistryHive : RegistryBase
     private List<RegistryKey> GetSubKeysAndValues(RegistryKey key)
     {
         _relativeOffsetKeyMap.Add(key.NkRecord.RelativeOffset, key);
+
+        KeysProcessed += 1;
+        if (KeysProcessed % ProgressLogIntervalKeys == 0)
+        {
+            var elapsed = _progressStopwatch?.Elapsed ?? TimeSpan.Zero;
+            var rate = elapsed.TotalSeconds > 0 ? KeysProcessed / elapsed.TotalSeconds : 0;
+            Log.Information(
+                "Parsing progress: {KeysProcessed:N0} keys processed so far ({ElapsedSeconds:N0}s elapsed, ~{Rate:N0} keys/sec)",
+                KeysProcessed, elapsed.TotalSeconds, rate);
+        }
 
 
         if (_keyPathKeyMap.ContainsKey(key.KeyPath.ToLowerInvariant()))
@@ -834,17 +854,24 @@ public class RegistryHive : RegistryBase
 
     public RegistryKey GetKey(string keyPath)
     {
-        keyPath = keyPath.ToLowerInvariant();
+        var original = keyPath.ToLowerInvariant();
+
+        // Try the exact path first (untrimmed) -- some key names legitimately end with a slash (e.g. URL-shaped
+        // key names such as "https://example.com/"), and trimming that slash would cause a false miss.
+        if (_keyPathKeyMap.TryGetValue(original, out var exactKey)) return exactKey;
+
+        var exactWithRoot = $"{Root.KeyName}\\{original}".ToLowerInvariant();
+        if (_keyPathKeyMap.TryGetValue(exactWithRoot, out var exactWithRootKey)) return exactWithRootKey;
 
         //trim slashes to match the value in keyPathKeyMap
-        keyPath = keyPath.Trim('\\', '/');
+        var keyPathTrimmed = original.Trim('\\', '/');
 
-        if (_keyPathKeyMap.ContainsKey(keyPath)) return _keyPathKeyMap[keyPath];
+        if (_keyPathKeyMap.TryGetValue(keyPathTrimmed, out var trimmedKey)) return trimmedKey;
 
         //handle case where someone doesn't pass in ROOT keyname
-        var newPath = $"{Root.KeyName}\\{keyPath}".ToLowerInvariant();
+        var newPath = $"{Root.KeyName}\\{keyPathTrimmed}".ToLowerInvariant();
 
-        if (_keyPathKeyMap.ContainsKey(newPath)) return _keyPathKeyMap[newPath];
+        if (_keyPathKeyMap.TryGetValue(newPath, out var trimmedWithRootKey)) return trimmedWithRootKey;
 
         return null;
     }
@@ -868,6 +895,9 @@ public class RegistryHive : RegistryBase
 
         _keyPathKeyMap = new Dictionary<string, RegistryKey>();
         _relativeOffsetKeyMap = new Dictionary<long, RegistryKey>();
+
+        KeysProcessed = 0;
+        _progressStopwatch = System.Diagnostics.Stopwatch.StartNew();
 
         TotalBytesRead = 0;
 
@@ -1051,6 +1081,9 @@ public class RegistryHive : RegistryBase
         Root.SubKeys.AddRange(keys);
 
         Log.Debug("Hive processing complete!");
+        Log.Information(
+            "Parsing complete: {KeysProcessed:N0} total keys processed in {ElapsedSeconds:N0}s",
+            KeysProcessed, _progressStopwatch?.Elapsed.TotalSeconds ?? 0);
 
         //All processing is complete, so we do some tests to see if we really saw everything
         if (RecoverDeleted && HiveLength() != TotalBytesRead)

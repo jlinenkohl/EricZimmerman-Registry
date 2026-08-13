@@ -7,6 +7,11 @@
         <AssemblyName>RegistryToolkit</AssemblyName>
         <RootNamespace>RegistryToolkit</RootNamespace>
         <Description>CLI toolkit for analyzing, validating, and repairing Windows Registry hive files (parsing, integrity checks, oversized/truncated hive recovery, bloat analysis, and key pruning/compaction).</Description>
+        <!-- Server GC handles large-heap, allocation-heavy workloads (e.g. rewriting multi-GB hives with
+             millions of small NK/VK cell allocations) far better than the default Workstation GC, which can
+             suffer severe throughput collapse and heap bloat under this kind of sustained allocation pressure. -->
+        <ServerGarbageCollection>true</ServerGarbageCollection>
+        <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
     </PropertyGroup>
 
     <ItemGroup>
