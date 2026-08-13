@@ -4,6 +4,7 @@ using System.Linq;
 using System.Security.Cryptography;
 using Registry.Abstractions;
 using Registry.Cells;
+using Registry.Lists;
 
 namespace Registry.Analysis;
 
@@ -250,6 +251,221 @@ public static class HiveAnalyzer
     }
 
     /// <summary>
+    ///     Sums the total on-disk bytes consumed by every category of cell/record in the hive (NK, VK header,
+    ///     SK, LK, each subkey-list record signature, and value-data payload cells), plus free-cell/free-list
+    ///     bytes. This directly answers "where did the gigabytes go" for a large hive: counts alone
+    ///     (<see cref="GetTopSubkeyCounts" />) only show *how many* keys/values exist, not how many bytes they
+    ///     and their value data actually consume on disk.
+    ///     <remarks>
+    ///         Value data is the category most commonly missing from a naive size estimate: a VK cell record
+    ///         only stores a small header (name + type + length + a 4-byte pointer/offset), never the value's
+    ///         actual bytes (unless the value is "resident", i.e. &lt;= 4 bytes and stored inline). All
+    ///         non-resident value data -- which for large hives is typically the overwhelming majority of the
+    ///         file -- lives in separate, untyped "data" cells that the base parser does not track as first
+    ///         class records at all (see <c>HBinRecord.Process</c>'s <c>DataNode</c> fallback case). This
+    ///         method walks every in-use VK record's <c>OffsetToData</c> (and, for "big data" values &gt; 16,344
+    ///         bytes, every fragment referenced by its <c>db</c> list record) to size those otherwise-invisible
+    ///         cells directly from the hive bytes, without materializing their full payloads in memory.
+    ///     </remarks>
+    /// </summary>
+    public static CellSizeBreakdownReport GetCellSizeBreakdown(RegistryHive hive)
+    {
+        if (hive?.CellRecords == null)
+        {
+            throw new ArgumentException("Hive must be parsed before analysis.", nameof(hive));
+        }
+
+        var report = new CellSizeBreakdownReport();
+
+        foreach (var cell in hive.CellRecords.Values)
+        {
+            var size = Math.Abs(cell.Size);
+
+            if (cell.IsFree)
+            {
+                report.FreeCellBytes += size;
+                continue;
+            }
+
+            switch (cell.Signature)
+            {
+                case "nk":
+                    report.NkCellBytes += size;
+                    break;
+                case "vk":
+                    report.VkCellBytes += size;
+                    break;
+                case "sk":
+                    report.SkCellBytes += size;
+                    break;
+                case "lk":
+                    report.LkCellBytes += size;
+                    break;
+            }
+
+            if (cell is VkCellRecord vk)
+            {
+                report.ValueDataBytes += GetValueDataCellSize(hive, vk);
+            }
+        }
+
+        foreach (var list in hive.ListRecords.Values)
+        {
+            var size = Math.Abs(list.Size);
+
+            if (list.IsFree)
+            {
+                report.FreeListBytes += size;
+                continue;
+            }
+
+            report.ListRecordBytesBySignature.TryGetValue(list.Signature, out var existing);
+            report.ListRecordBytesBySignature[list.Signature] = existing + size;
+        }
+
+        report.HbinHeaderBytes = (long) hive.HBinRecordCount * 0x20;
+        report.RegfHeaderBytes = 0x1000;
+        report.TotalHiveBytes = report.RegfHeaderBytes + hive.HBinRecordTotalSize;
+
+        report.AccountedBytes = report.NkCellBytes + report.VkCellBytes + report.SkCellBytes + report.LkCellBytes
+                                 + report.ListRecordBytesBySignature.Values.Sum()
+                                 + report.ValueDataBytes + report.FreeCellBytes + report.FreeListBytes
+                                 + report.HbinHeaderBytes + report.RegfHeaderBytes;
+
+        report.UnaccountedBytes = report.TotalHiveBytes - report.AccountedBytes;
+
+        return report;
+    }
+
+    /// <summary>
+    ///     Walks the hive's key tree and, for every key, computes both its own direct byte footprint (its NK
+    ///     cell, its values' VK cells, and those values' data cells) and the total footprint of its entire
+    ///     subtree (itself plus every descendant), then returns the keys with the largest subtree footprint.
+    ///     <remarks>
+    ///         This is the byte-size counterpart to <see cref="GetTopSubkeyCounts" />: a key can have a huge
+    ///         subkey *count* but a small subkey-list-chain overhead (a few bytes per entry), while its true
+    ///         cost lies in the cumulative size of every descendant's NK/VK cells and value data. Ranking by
+    ///         subtree bytes (rather than count alone) correctly identifies the actual "top offender" to target
+    ///         with <c>--pruneKey</c> when several candidate keys have a similar subkey count but very
+    ///         different value-data payloads. Subkey-list-record (lf/lh/li/ri) chain overhead is intentionally
+    ///         excluded from per-key totals (it is reported in aggregate by
+    ///         <see cref="GetCellSizeBreakdown" /> instead) since it is small and shared/rebuilt as a whole
+    ///         chain rather than cleanly attributable to a single key.
+    ///     </remarks>
+    /// </summary>
+    public static List<KeySizeReport> GetTopKeysBySize(RegistryHive hive, int topN = 20, long minSubtreeBytes = 1024 * 1024)
+    {
+        if (hive?.Root == null)
+        {
+            throw new ArgumentException("Hive must be parsed (hive.Root must not be null) before analysis.", nameof(hive));
+        }
+
+        var results = new List<KeySizeReport>();
+
+        (long directBytes, long subtreeBytes, long subtreeKeyCount) Walk(RegistryKey key)
+        {
+            long directBytes = Math.Abs(key.NkRecord.Size);
+
+            foreach (var value in key.Values)
+            {
+                directBytes += Math.Abs(value.VkRecord.Size);
+                directBytes += GetValueDataCellSize(hive, value.VkRecord);
+            }
+
+            var subtreeBytes = directBytes;
+            var subtreeKeyCount = 1L;
+
+            foreach (var subKey in key.SubKeys)
+            {
+                var (_, childSubtreeBytes, childKeyCount) = Walk(subKey);
+                subtreeBytes += childSubtreeBytes;
+                subtreeKeyCount += childKeyCount;
+            }
+
+            if (subtreeBytes >= minSubtreeBytes)
+            {
+                results.Add(new KeySizeReport
+                {
+                    KeyPath = key.KeyPath,
+                    DirectBytes = directBytes,
+                    SubtreeBytes = subtreeBytes,
+                    SubtreeKeyCount = subtreeKeyCount,
+                    SubkeyCount = key.SubKeys.Count,
+                    ValueCount = key.Values.Count
+                });
+            }
+
+            return (directBytes, subtreeBytes, subtreeKeyCount);
+        }
+
+        Walk(hive.Root);
+
+        return results
+            .OrderByDescending(r => r.SubtreeBytes)
+            .ThenByDescending(r => r.SubtreeKeyCount)
+            .Take(topN)
+            .ToList();
+    }
+
+    /// <summary>
+    ///     Computes the number of bytes consumed by a single VK record's non-resident data cell(s), without
+    ///     reading the actual value payload into memory. Returns 0 for resident values (data stored inline in
+    ///     the VK cell itself, already counted as part of the VK cell's own size).
+    /// </summary>
+    private static long GetValueDataCellSize(RegistryHive hive, VkCellRecord vk)
+    {
+        const uint residentFlag = 0x80000000;
+
+        if ((vk.DataLength & residentFlag) != 0)
+        {
+            // Data is resident (stored inline in the VK cell itself); no separate data cell exists.
+            return 0;
+        }
+
+        try
+        {
+            var sizeRaw = hive.ReadBytesFromHive(4096 + vk.OffsetToData, 4);
+            if (sizeRaw.Length < 4)
+            {
+                return 0;
+            }
+
+            var dataBlockSize = Math.Abs(BitConverter.ToInt32(sizeRaw, 0));
+
+            if (vk.DataLength > 16344 && hive.Header.MinorVersion > 3)
+            {
+                // "Big data" case: the cell at OffsetToData is itself a 'db' list record (already counted
+                // in ListRecordBytesBySignature["db"]); walk it to size the offsets-array cell and every
+                // fragment cell it points to, none of which are tracked anywhere else.
+                var dbRaw = hive.ReadBytesFromHive(4096 + vk.OffsetToData, dataBlockSize);
+                var db = new DbListRecord(dbRaw, 4096 + vk.OffsetToData);
+
+                var offsetsSizeRaw = hive.ReadBytesFromHive(4096 + db.OffsetToOffsets, 4);
+                var offsetsBlockSize = Math.Abs(BitConverter.ToInt32(offsetsSizeRaw, 0));
+                var offsetsRaw = hive.ReadBytesFromHive(4096 + db.OffsetToOffsets, offsetsBlockSize);
+
+                long total = offsetsBlockSize;
+
+                for (var i = 1; i <= db.NumberOfEntries; i++)
+                {
+                    var fragOffset = BitConverter.ToUInt32(offsetsRaw, i * 4);
+                    var fragSizeRaw = hive.ReadBytesFromHive(4096 + fragOffset, 4);
+                    total += Math.Abs(BitConverter.ToInt32(fragSizeRaw, 0));
+                }
+
+                return total;
+            }
+
+            return dataBlockSize;
+        }
+        catch
+        {
+            // Best-effort accounting; a malformed/free record's data pointer should not abort analysis.
+            return 0;
+        }
+    }
+
+    /// <summary>
     ///     Finds the specified key by path (case-insensitive, backslash-delimited, starting from Root's own
     ///     name e.g. "ROOT\Software\...") and, if found, reports its subkeys grouped by a "template" name
     ///     derived by stripping trailing "#" + digits counters and GUID-like segments. This is useful for
@@ -329,6 +545,59 @@ public class KeySubkeyCount
 public class KeyValueCount
 {
     public string KeyPath { get; set; }
+    public int ValueCount { get; set; }
+}
+
+/// <summary>
+///     Result of <see cref="HiveAnalyzer.GetCellSizeBreakdown" />: total on-disk bytes consumed by each
+///     category of cell/record in the hive.
+/// </summary>
+public class CellSizeBreakdownReport
+{
+    public long NkCellBytes { get; set; }
+    public long VkCellBytes { get; set; }
+    public long SkCellBytes { get; set; }
+    public long LkCellBytes { get; set; }
+    public Dictionary<string, long> ListRecordBytesBySignature { get; } = new();
+    public long ValueDataBytes { get; set; }
+    public long FreeCellBytes { get; set; }
+    public long FreeListBytes { get; set; }
+    public long HbinHeaderBytes { get; set; }
+    public long RegfHeaderBytes { get; set; }
+
+    /// <summary>The declared total size of the hive (regf header + all hbins).</summary>
+    public long TotalHiveBytes { get; set; }
+
+    /// <summary>Sum of every category above.</summary>
+    public long AccountedBytes { get; set; }
+
+    /// <summary>
+    ///     <see cref="TotalHiveBytes" /> minus <see cref="AccountedBytes" />. A non-trivial value here
+    ///     represents bytes the analyzer could not attribute to a specific tracked category -- most commonly
+    ///     free/deleted "data" cells (which, unlike free NK/VK/SK/LK cells, are never wrapped in a typed
+    ///     record and so are invisible to <c>hive.CellRecords</c>/<c>hive.ListRecords</c> entirely), and any
+    ///     other slack/padding space within hbins.
+    /// </summary>
+    public long UnaccountedBytes { get; set; }
+}
+
+/// <summary>
+///     Result entry from <see cref="HiveAnalyzer.GetTopKeysBySize" />.
+/// </summary>
+public class KeySizeReport
+{
+    public string KeyPath { get; set; }
+
+    /// <summary>Bytes consumed by this key's own NK cell, its values' VK cells, and their value data.</summary>
+    public long DirectBytes { get; set; }
+
+    /// <summary>Bytes consumed by this key and every descendant key/value in its subtree.</summary>
+    public long SubtreeBytes { get; set; }
+
+    /// <summary>Total number of keys (including itself) in this key's subtree.</summary>
+    public long SubtreeKeyCount { get; set; }
+
+    public int SubkeyCount { get; set; }
     public int ValueCount { get; set; }
 }
 

@@ -95,7 +95,7 @@ internal class Program
 
         if (options.AnalyzeBloat)
         {
-            PrintBloatAnalysis(originalHive);
+            PrintBloatAnalysis(originalHive, options);
         }
 
         if (!string.IsNullOrWhiteSpace(options.PruneKeyPath))
@@ -360,7 +360,7 @@ internal class Program
         }
     }
 
-    private static void PrintBloatAnalysis(RegistryHive hive)
+    private static void PrintBloatAnalysis(RegistryHive hive, Options options)
     {
         Console.WriteLine("================================================================================");
         Console.WriteLine("Bloat / integrity analysis (--analyzeBloat)");
@@ -370,6 +370,28 @@ internal class Program
             var reachability = HiveAnalyzer.AnalyzeReachability(hive);
             Console.WriteLine(
                 $"Reachability: reachableKeys={reachability.ReachableKeys:N0}, reachableValues={reachability.ReachableValues:N0}, totalInUseKeyCells={reachability.TotalInUseKeyCells:N0}, totalInUseValueCells={reachability.TotalInUseValueCells:N0}");
+
+            var sizeBreakdown = HiveAnalyzer.GetCellSizeBreakdown(hive);
+            Console.WriteLine("Byte-size breakdown (where the file's bytes actually go):");
+            Console.WriteLine($"  Total hive size:      {sizeBreakdown.TotalHiveBytes:N0} bytes (0x{sizeBreakdown.TotalHiveBytes:X})");
+            Console.WriteLine($"  NK (key) cells:       {sizeBreakdown.NkCellBytes:N0} bytes");
+            Console.WriteLine($"  VK (value) cells:     {sizeBreakdown.VkCellBytes:N0} bytes (headers only; excludes value data)");
+            Console.WriteLine($"  Value data cells:     {sizeBreakdown.ValueDataBytes:N0} bytes (non-resident value payloads, incl. 'big data' fragments)");
+            Console.WriteLine($"  SK (security) cells:  {sizeBreakdown.SkCellBytes:N0} bytes");
+            Console.WriteLine($"  LK cells:             {sizeBreakdown.LkCellBytes:N0} bytes");
+            foreach (var kvp in sizeBreakdown.ListRecordBytesBySignature.OrderByDescending(k => k.Value))
+            {
+                Console.WriteLine($"  '{kvp.Key}' list records:    {kvp.Value:N0} bytes");
+            }
+            Console.WriteLine($"  Free/deleted cells:   {sizeBreakdown.FreeCellBytes:N0} bytes");
+            Console.WriteLine($"  Free/deleted lists:   {sizeBreakdown.FreeListBytes:N0} bytes");
+            Console.WriteLine($"  hbin/regf headers:    {(sizeBreakdown.HbinHeaderBytes + sizeBreakdown.RegfHeaderBytes):N0} bytes");
+            Console.WriteLine($"  Unaccounted:          {sizeBreakdown.UnaccountedBytes:N0} bytes ({(sizeBreakdown.TotalHiveBytes == 0 ? 0 : (double) sizeBreakdown.UnaccountedBytes / sizeBreakdown.TotalHiveBytes):P1} of file)");
+            if (sizeBreakdown.UnaccountedBytes > sizeBreakdown.TotalHiveBytes / 20)
+            {
+                Console.WriteLine(
+                    "  Note: a large unaccounted share is most commonly free/deleted 'data' cells (never wrapped in a typed record and therefore untracked here) and/or hbin slack space -- run with -r/--recover-deleted for deeper visibility into deleted content.");
+            }
 
             var topSubkeys = HiveAnalyzer.GetTopSubkeyCounts(hive);
             Console.WriteLine($"Top subkey-count keys (>= 50 subkeys): {topSubkeys.Count}");
@@ -383,6 +405,14 @@ internal class Program
             foreach (var entry in topValues.OrderByDescending(k => k.ValueCount).Take(10))
             {
                 Console.WriteLine($"  {entry.ValueCount:N0} values: {entry.KeyPath}");
+            }
+
+            var topBySize = HiveAnalyzer.GetTopKeysBySize(hive);
+            Console.WriteLine($"Top keys by total subtree size (>= 1 MB): {topBySize.Count}");
+            foreach (var entry in topBySize.Take(10))
+            {
+                Console.WriteLine(
+                    $"  {entry.SubtreeBytes:N0} bytes across {entry.SubtreeKeyCount:N0} keys ({entry.SubkeyCount:N0} direct subkeys, {entry.ValueCount:N0} direct values): {entry.KeyPath}");
             }
 
             if (topSubkeys.Count > 0)
@@ -403,6 +433,47 @@ internal class Program
                     Console.WriteLine(
                         "  If this pattern shows a large count with an incrementing counter suffix and a wide LastWrite spread, it likely indicates an application/service bug (e.g. an unbounded cache) rather than corruption. Consider --pruneKey to remediate.");
                 }
+            }
+
+            // Rank the "top offender" for a suggested --pruneKey command using only keys that are themselves
+            // the *direct* holder of a large subkey count (topSubkeys, count >= 50) as the candidate pool --
+            // ranking every key in the hive by subtree bytes alone (including ancestors) would always pick
+            // the root/near-root keys, since a parent's subtree necessarily contains its children's bytes,
+            // identifying "where the bytes are" but not an actionable, specific --pruneKey target. An ancestor
+            // of another candidate is excluded from the pool for the same reason (its subtree bytes trivially
+            // include the descendant candidate's, without itself being the runaway-growth point). Within the
+            // remaining, structurally-independent candidates, rank by total subtree byte size (falling back to
+            // subkey count as a tiebreak) so the selection reflects both count *and* total cell size consumed,
+            // per user request, rather than count alone.
+            var candidatePaths = topSubkeys
+                .Select(s => new
+                {
+                    s.KeyPath,
+                    s.SubkeyCount,
+                    SubtreeBytes = topBySize.FirstOrDefault(b => b.KeyPath == s.KeyPath)?.SubtreeBytes ?? 0
+                })
+                .ToList();
+
+            var offenderCandidates = candidatePaths
+                .Where(c => !candidatePaths.Any(other =>
+                    !string.Equals(other.KeyPath, c.KeyPath, StringComparison.OrdinalIgnoreCase) &&
+                    other.KeyPath.StartsWith(c.KeyPath + "\\", StringComparison.OrdinalIgnoreCase)))
+                .OrderByDescending(c => c.SubtreeBytes)
+                .ThenByDescending(c => c.SubkeyCount)
+                .FirstOrDefault();
+
+            if (offenderCandidates != null)
+            {
+                var suggestedOutput = string.IsNullOrWhiteSpace(options.OutputPath)
+                    ? Path.Combine(Path.GetDirectoryName(Path.GetFullPath(options.HivePath)) ?? ".",
+                        Path.GetFileNameWithoutExtension(options.HivePath) + "_pruned" + Path.GetExtension(options.HivePath))
+                    : options.OutputPath;
+
+                Console.WriteLine(
+                    $"Top offender (ranked by subkey count AND total subtree bytes): '{offenderCandidates.KeyPath}' -- {offenderCandidates.SubkeyCount:N0} subkeys, ~{offenderCandidates.SubtreeBytes:N0} bytes.");
+                Console.WriteLine("Suggested remediation command:");
+                Console.WriteLine(
+                    $"  RegistryToolkit -f \"{options.HivePath}\" --pruneKey \"{offenderCandidates.KeyPath}\" --keepRecent 500 -o \"{suggestedOutput}\"");
             }
 
             var duplicates = HiveAnalyzer.FindDuplicateCellGroups(hive, 16);
