@@ -10,6 +10,14 @@ namespace Registry;
 
 public class RegistryBase : IRegistry
 {
+    /// <summary>
+    /// The CLR's actual maximum single-dimension array length (0x7FFFFFC7), which is 88 elements
+    /// smaller than int.MaxValue (0x7FFFFFFF). Allocating a byte[] any larger than this throws
+    /// "Array dimensions exceeded supported range", so this is the true cap to use instead of
+    /// int.MaxValue when sizing FileBytes.
+    /// </summary>
+    internal const int MaxByteArrayLength = 0x7FFFFFC7;
+
     public RegistryBase()
     {
         throw new NotSupportedException("Call the other constructor and pass in the path to the Registry hive!");
@@ -28,6 +36,8 @@ public class RegistryBase : IRegistry
 
             throw new ArgumentException("Data in byte array is not a Registry hive (bad signature)");
         }
+
+        ApplyExceeds2GbRecoveryPadding();
 
         HivePath = hivePath;
 
@@ -50,7 +60,18 @@ public class RegistryBase : IRegistry
 
         binaryReader.BaseStream.Seek(0, SeekOrigin.Begin);
 
-        FileBytes = binaryReader.ReadBytes((int) binaryReader.BaseStream.Length);
+        var streamLength = binaryReader.BaseStream.Length;
+        var byteCountToRead = GetByteCountToRead(streamLength, RegistryParseSettings.Exceeds2GbRecovery, hivePath);
+
+        if (byteCountToRead == MaxByteArrayLength && streamLength > MaxByteArrayLength)
+        {
+            var msg =
+                $"Exceeds2GbRecovery enabled: hive file size is 0x{streamLength:X}, loading first 0x{MaxByteArrayLength:X} bytes due to parser byte-array limit.";
+            Log.Warning(msg);
+            RegistryParseSettings.RecordCorruption(msg);
+        }
+
+        FileBytes = binaryReader.ReadBytes(byteCountToRead);
 
         binaryReader.Close();
         fileStream.Close();
@@ -62,6 +83,8 @@ public class RegistryBase : IRegistry
 
             throw new Exception($"{hivePath} is not a Registry hive (bad signature)");
         }
+
+        ApplyExceeds2GbRecoveryPadding();
 
         HivePath = hivePath;
 
@@ -193,5 +216,56 @@ public class RegistryBase : IRegistry
         var sig = BitConverter.ToInt32(FileBytes, 0);
 
         return sig.Equals(RegfSignature);
+    }
+
+    private void ApplyExceeds2GbRecoveryPadding()
+    {
+        if (!RegistryParseSettings.Exceeds2GbRecovery || FileBytes.Length < 0x2c)
+        {
+            return;
+        }
+
+        var declaredHiveLength = BitConverter.ToUInt32(FileBytes, 0x28);
+        var declaredFileLength = declaredHiveLength + 0x1000UL;
+
+        if (declaredFileLength <= (ulong)FileBytes.Length)
+        {
+            return;
+        }
+
+        if (declaredFileLength > MaxByteArrayLength)
+        {
+            var msg =
+                $"Exceeds2GbRecovery was enabled, but declared hive size (0x{declaredFileLength:X}) exceeds byte-array parser limit.";
+            Log.Warning(msg);
+            RegistryParseSettings.RecordCorruption(msg);
+            return;
+        }
+
+        var originalLength = FileBytes.Length;
+        var local = FileBytes;
+        Array.Resize(ref local, (int)declaredFileLength);
+        FileBytes = local;
+
+        var resizeMessage =
+            $"Exceeds2GbRecovery padded hive bytes from 0x{(ulong)originalLength:X} to declared length 0x{declaredFileLength:X}.";
+        Log.Warning(resizeMessage);
+        RegistryParseSettings.RecordCorruption(resizeMessage);
+    }
+
+    internal static int GetByteCountToRead(long streamLength, bool exceeds2GbRecovery, string hivePath)
+    {
+        if (streamLength <= MaxByteArrayLength)
+        {
+            return (int)streamLength;
+        }
+
+        if (!exceeds2GbRecovery)
+        {
+            throw new ArgumentOutOfRangeException(nameof(hivePath),
+                $"Hive file size (0x{streamLength:X}) exceeds parser byte-array limit (0x{MaxByteArrayLength:X}). Enable Exceeds2GbRecovery to load the maximum supported bytes.");
+        }
+
+        return MaxByteArrayLength;
     }
 }

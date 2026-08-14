@@ -28,6 +28,16 @@ public class RegistryHive : RegistryBase
     private Dictionary<long, RegistryKey> _relativeOffsetKeyMap = new();
 
     /// <summary>
+    ///     Number of keys processed so far by GetSubKeysAndValues during ParseHive(). Exposed so callers can
+    ///     poll it (e.g. from another thread) to observe parse progress on very large hives, where the tree
+    ///     walk can take a long time and would otherwise appear to hang.
+    /// </summary>
+    public long KeysProcessed;
+
+    private const int ProgressLogIntervalKeys = 10_000;
+    private System.Diagnostics.Stopwatch _progressStopwatch;
+
+    /// <summary>
     ///     If true, CellRecords and ListRecords will be purged to free memory
     /// </summary>
     public bool FlushRecordListsAfterParse = true;
@@ -323,6 +333,16 @@ public class RegistryHive : RegistryBase
     private List<RegistryKey> GetSubKeysAndValues(RegistryKey key)
     {
         _relativeOffsetKeyMap.Add(key.NkRecord.RelativeOffset, key);
+
+        KeysProcessed += 1;
+        if (KeysProcessed % ProgressLogIntervalKeys == 0)
+        {
+            var elapsed = _progressStopwatch?.Elapsed ?? TimeSpan.Zero;
+            var rate = elapsed.TotalSeconds > 0 ? KeysProcessed / elapsed.TotalSeconds : 0;
+            Log.Information(
+                "Parsing progress: {KeysProcessed:N0} keys processed so far ({ElapsedSeconds:N0}s elapsed, ~{Rate:N0} keys/sec)",
+                KeysProcessed, elapsed.TotalSeconds, rate);
+        }
 
 
         if (_keyPathKeyMap.ContainsKey(key.KeyPath.ToLowerInvariant()))
@@ -834,17 +854,24 @@ public class RegistryHive : RegistryBase
 
     public RegistryKey GetKey(string keyPath)
     {
-        keyPath = keyPath.ToLowerInvariant();
+        var original = keyPath.ToLowerInvariant();
+
+        // Try the exact path first (untrimmed) -- some key names legitimately end with a slash (e.g. URL-shaped
+        // key names such as "https://example.com/"), and trimming that slash would cause a false miss.
+        if (_keyPathKeyMap.TryGetValue(original, out var exactKey)) return exactKey;
+
+        var exactWithRoot = $"{Root.KeyName}\\{original}".ToLowerInvariant();
+        if (_keyPathKeyMap.TryGetValue(exactWithRoot, out var exactWithRootKey)) return exactWithRootKey;
 
         //trim slashes to match the value in keyPathKeyMap
-        keyPath = keyPath.Trim('\\', '/');
+        var keyPathTrimmed = original.Trim('\\', '/');
 
-        if (_keyPathKeyMap.ContainsKey(keyPath)) return _keyPathKeyMap[keyPath];
+        if (_keyPathKeyMap.TryGetValue(keyPathTrimmed, out var trimmedKey)) return trimmedKey;
 
         //handle case where someone doesn't pass in ROOT keyname
-        var newPath = $"{Root.KeyName}\\{keyPath}".ToLowerInvariant();
+        var newPath = $"{Root.KeyName}\\{keyPathTrimmed}".ToLowerInvariant();
 
-        if (_keyPathKeyMap.ContainsKey(newPath)) return _keyPathKeyMap[newPath];
+        if (_keyPathKeyMap.TryGetValue(newPath, out var trimmedWithRootKey)) return trimmedWithRootKey;
 
         return null;
     }
@@ -869,6 +896,9 @@ public class RegistryHive : RegistryBase
         _keyPathKeyMap = new Dictionary<string, RegistryKey>();
         _relativeOffsetKeyMap = new Dictionary<long, RegistryKey>();
 
+        KeysProcessed = 0;
+        _progressStopwatch = System.Diagnostics.Stopwatch.StartNew();
+
         TotalBytesRead = 0;
 
         TotalBytesRead += 4096;
@@ -885,6 +915,21 @@ public class RegistryHive : RegistryBase
             Log.Debug("Header length is smaller than the size of the file.");
             hiveLength = (uint) FileBytes.Length;
         }
+        else if (hiveLength > FileBytes.Length)
+        {
+            // The hive declares more data than is actually available in FileBytes. This happens when
+            // Exceeds2GbRecovery clamped/truncated the loaded bytes below the file's real/declared
+            // size. Parsing must not walk past what was actually loaded: doing so would read
+            // truncated/empty byte spans from ReadBytesFromHive() near the tail and throw. Cap the
+            // scan to the loaded bytes and make the resulting incomplete parse explicit, since it can
+            // otherwise look like a clean, fully-parsed hive when large portions were never read.
+            var missingBytes = (ulong) hiveLength - (ulong) FileBytes.Length;
+            var msg =
+                $"Hive declares a total length of 0x{hiveLength:X} bytes, but only 0x{FileBytes.Length:X} bytes were loaded ({missingBytes:N0} bytes / ~{missingBytes / 4096:N0} potential hbins were not loaded). Parsing is limited to the loaded bytes; results below are incomplete and do not cover the full hive.";
+            Log.Warning(msg);
+            RegistryParseSettings.RecordCorruption(msg);
+            hiveLength = (uint) FileBytes.Length;
+        }
 
         if (Header.PrimarySequenceNumber != Header.SecondarySequenceNumber)
             Log.Warning(
@@ -899,9 +944,13 @@ public class RegistryHive : RegistryBase
             {
                 Log.Debug("Found hbin with size 0 at absolute offset {Offset}. Skipping 0x1000 bytes...",
                     $"0x{offsetInHive:X}");
-                // Go to end if we find a 0 size block (padding?)
-                offsetInHive += 4096; //HiveLength();
-                TotalBytesRead += 4096;
+                // Go to end if we find a 0 size block (padding?). Cap the skip so offsetInHive/TotalBytesRead
+                // never overshoot hiveLength when fewer than 4096 bytes remain (e.g. a short tail left after
+                // Exceeds2GbRecovery truncation), which would otherwise make TotalBytesRead misreport more
+                // bytes as "read" than were actually available.
+                var paddingSkip = (int) Math.Min(4096, hiveLength - offsetInHive);
+                offsetInHive += paddingSkip;
+                TotalBytesRead += paddingSkip;
                 continue;
             }
 
@@ -909,14 +958,22 @@ public class RegistryHive : RegistryBase
 
             if (hbinSig != HbinSignature)
             {
-                Log.Warning(
-                    "hbin header incorrect at absolute offset {OffsetInHive}!!! Percent done: {Percent}",
-                    $"0x{offsetInHive:X}", ((double) offsetInHive / hiveLength).ToString("P"));
+                var corruptionMessage =
+                    $"hbin header incorrect at absolute offset 0x{offsetInHive:X} (Percent done: {((double)offsetInHive / hiveLength):P})";
+                Log.Warning(corruptionMessage);
+                RegistryParseSettings.RecordCorruption(corruptionMessage);
 
 //                    if (RecoverDeleted) //TODO ? always or only if recoverdeleted
 //                    {
 //                        //TODO need to try to recover records from the bad chunk
 //                    }
+                if (RegistryParseSettings.ContinueOnCorruption)
+                {
+                    var corruptionSkip = (int) Math.Min(4096, hiveLength - offsetInHive);
+                    offsetInHive += corruptionSkip;
+                    TotalBytesRead += corruptionSkip;
+                    continue;
+                }
 
                 break;
             }
@@ -994,7 +1051,20 @@ public class RegistryHive : RegistryBase
                             (f.Flags & NkCellRecord.FlagEnum.HiveEntryRootKey) ==
                             NkCellRecord.FlagEnum.HiveEntryRootKey);
 
-            if (rootNode == null) throw new KeyNotFoundException("Root nk record not found!");
+            if (rootNode == null)
+            {
+                const string rootError = "Root nk record not found!";
+                RegistryParseSettings.RecordCorruption(rootError);
+
+                if (!RegistryParseSettings.ContinueOnCorruption)
+                {
+                    throw new KeyNotFoundException(rootError);
+                }
+
+                Log.Warning(rootError);
+                _parsed = true;
+                return false;
+            }
         }
 
         //validate what we found above via the flag method
@@ -1011,6 +1081,9 @@ public class RegistryHive : RegistryBase
         Root.SubKeys.AddRange(keys);
 
         Log.Debug("Hive processing complete!");
+        Log.Information(
+            "Parsing complete: {KeysProcessed:N0} total keys processed in {ElapsedSeconds:N0}s",
+            KeysProcessed, _progressStopwatch?.Elapsed.TotalSeconds ?? 0);
 
         //All processing is complete, so we do some tests to see if we really saw everything
         if (RecoverDeleted && HiveLength() != TotalBytesRead)
@@ -1018,17 +1091,24 @@ public class RegistryHive : RegistryBase
             var remainingHive = ReadBytesFromHive(TotalBytesRead, (int) (HiveLength() - TotalBytesRead));
 
             //Sometimes the remainder of the file is all zeros, which is useless, so check for that
-            if (!Array.TrueForAll(remainingHive, a => a == 0))
+            var remainderIsAllZero = Array.TrueForAll(remainingHive, a => a == 0);
+
+            if (!remainderIsAllZero)
+            {
                 Log.Warning(
                     "Extra, non-zero data found beyond hive length! Check for erroneous data starting at {BytesRead}!",
                     $"0x{TotalBytesRead:X}");
 
-            //as a second check, compare Header length with what we read (taking the header into account as Header.Length is only for hbin records)
-
-            if (Header.Length != TotalBytesRead - 0x1000)
-                Log.Warning( //ncrunch: no coverage
-                    "Hive length ({HiveLength}) does not equal bytes read ({TotalBytesRead})!! Check the end of the hive for erroneous data",
-                    $"0x{HiveLength():X}", $"0x{TotalBytesRead:X}");
+                //as a second check, compare Header length with what we read (taking the header into account as Header.Length is only for hbin records).
+                //Only warn here when the extra data is actually non-zero: benign trailing padding/slack space
+                //(the common case once a hive is loaded via Exceeds2GbRecovery) already produced the warning
+                //above when non-zero, so this avoids a redundant, misleading "erroneous data" warning for
+                //harmless all-zero padding.
+                if (Header.Length != TotalBytesRead - 0x1000)
+                    Log.Warning( //ncrunch: no coverage
+                        "Hive length ({HiveLength}) does not equal bytes read ({TotalBytesRead})!! Check the end of the hive for erroneous data",
+                        $"0x{HiveLength():X}", $"0x{TotalBytesRead:X}");
+            }
         }
 
         if (RecoverDeleted) BuildDeletedRegistryKeys();

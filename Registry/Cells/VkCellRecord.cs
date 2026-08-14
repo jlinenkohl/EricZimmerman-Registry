@@ -122,6 +122,8 @@ public class VkCellRecord : ICellTemplate, IRecordBase
 
     private readonly IRegistry _registryHive;
 
+    private byte[] _rawBytes;
+
     private uint _dataLengthInternal;
     private int _internalDataOffset;
 
@@ -902,9 +904,14 @@ public class VkCellRecord : ICellTemplate, IRecordBase
     {
         get
         {
-            var raw = _registryHive.ReadBytesFromHive(AbsoluteOffset, _rawBytesLength);
+            if (_rawBytes == null)
+                // See NkCellRecord.RawBytes for rationale: caching avoids re-reading/re-copying the same
+                // bytes from the hive's FileBytes array on every property access. A clone is returned
+                // (rather than the cached array) because callers such as RegistrySkeleton mutate the
+                // returned array in place.
+                _rawBytes = _registryHive.ReadBytesFromHive(AbsoluteOffset, _rawBytesLength);
 
-            return raw;
+            return (byte[]) _rawBytes.Clone();
         }
     }
 

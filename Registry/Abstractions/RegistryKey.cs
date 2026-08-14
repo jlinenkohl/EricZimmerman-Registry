@@ -71,7 +71,13 @@ public class RegistryKey
                 //This is the root key
                 return $"{KeyName}";
 
-            return $@"{Parent.KeyPath}\{KeyName}";
+            // Cache the computed path so repeated access (e.g. from _keyPathKeyMap lookups/inserts during
+            // tree-walking of hives with very large numbers of keys) doesn't repeatedly recurse up the
+            // parent chain. This is safe because Parent references are only ever assigned once per key
+            // during parse, and any legitimate rename path already goes through the KeyPath setter below.
+            _keyPath = $@"{Parent.KeyPath}\{KeyName}";
+
+            return _keyPath;
         }
 
         set => _keyPath = value;

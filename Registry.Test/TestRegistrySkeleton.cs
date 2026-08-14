@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Linq;
 using NFluent;
 using NUnit.Framework;
@@ -10,7 +10,7 @@ internal class TestRegistrySkeleton
     [Test]
     public void ShouldCreateRegistrySkeleton()
     {
-        var usrclassDeleted = new RegistryHive(@".\Hives\UsrClassDeletedBags.dat");
+        var usrclassDeleted = new RegistryHive(@"./Hives/UsrClassDeletedBags.dat");
         usrclassDeleted.RecoverDeleted = true;
         usrclassDeleted.FlushRecordListsAfterParse = false;
         usrclassDeleted.ParseHive();
@@ -33,7 +33,7 @@ internal class TestRegistrySkeleton
     [Test]
     public void ShouldReturnTrueOnAddMuiCacheSubkeyToSkeletonList()
     {
-        var usrclassDeleted = new RegistryHive(@".\Hives\UsrClassDeletedBags.dat");
+        var usrclassDeleted = new RegistryHive(@"./Hives/UsrClassDeletedBags.dat");
         usrclassDeleted.RecoverDeleted = true;
         usrclassDeleted.FlushRecordListsAfterParse = false;
         usrclassDeleted.ParseHive();
@@ -58,7 +58,7 @@ internal class TestRegistrySkeleton
     [Test]
     public void ShouldReturnFalseOnRemovingNonExistentKey()
     {
-        var usrclassDeleted = new RegistryHive(@".\Hives\UsrClassDeletedBags.dat");
+        var usrclassDeleted = new RegistryHive(@"./Hives/UsrClassDeletedBags.dat");
         usrclassDeleted.RecoverDeleted = true;
         usrclassDeleted.FlushRecordListsAfterParse = false;
         usrclassDeleted.ParseHive();
@@ -76,7 +76,7 @@ internal class TestRegistrySkeleton
     [Test]
     public void ShouldntAddDuplicateSkeletonKeys()
     {
-        var usrclassDeleted = new RegistryHive(@".\Hives\UsrClassDeletedBags.dat");
+        var usrclassDeleted = new RegistryHive(@"./Hives/UsrClassDeletedBags.dat");
         usrclassDeleted.RecoverDeleted = true;
         usrclassDeleted.FlushRecordListsAfterParse = false;
         usrclassDeleted.ParseHive();
@@ -108,7 +108,7 @@ internal class TestRegistrySkeleton
     [Test]
     public void KeysCountShouldBeZeroAfterAddRemove()
     {
-        var usrclassDeleted = new RegistryHive(@".\Hives\UsrClassDeletedBags.dat");
+        var usrclassDeleted = new RegistryHive(@"./Hives/UsrClassDeletedBags.dat");
         usrclassDeleted.RecoverDeleted = true;
         usrclassDeleted.FlushRecordListsAfterParse = false;
         usrclassDeleted.ParseHive();
@@ -132,7 +132,7 @@ internal class TestRegistrySkeleton
     [Test]
     public void ShouldReturnFalseOnAddNonExistentSubkeyToSkeletonList()
     {
-        var usrclassDeleted = new RegistryHive(@".\Hives\UsrClassDeletedBags.dat");
+        var usrclassDeleted = new RegistryHive(@"./Hives/UsrClassDeletedBags.dat");
         usrclassDeleted.RecoverDeleted = true;
         usrclassDeleted.FlushRecordListsAfterParse = false;
         usrclassDeleted.ParseHive();
@@ -152,7 +152,7 @@ internal class TestRegistrySkeleton
     {
         Check.ThatCode(() =>
             {
-                var usrclassDeleted = new RegistryHive(@".\Hives\UsrClassDeletedBags.dat");
+                var usrclassDeleted = new RegistryHive(@"./Hives/UsrClassDeletedBags.dat");
                 usrclassDeleted.RecoverDeleted = true;
                 usrclassDeleted.FlushRecordListsAfterParse = false;
                 usrclassDeleted.ParseHive();
@@ -166,7 +166,7 @@ internal class TestRegistrySkeleton
     [Test]
     public void ShouldReturnTrueWhenWriteCalledWithKeyAdded()
     {
-        var usrclassDeleted = new RegistryHive(@".\Hives\UsrClassDeletedBags.dat");
+        var usrclassDeleted = new RegistryHive(@"./Hives/UsrClassDeletedBags.dat");
         usrclassDeleted.RecoverDeleted = true;
         usrclassDeleted.FlushRecordListsAfterParse = false;
         usrclassDeleted.ParseHive();
@@ -185,7 +185,7 @@ internal class TestRegistrySkeleton
     [Test]
     public void BigRecursiveWithRegUnknown()
     {
-        var system = new RegistryHive(@".\Hives\System");
+        var system = new RegistryHive(@"./Hives/SYSTEM");
         system.FlushRecordListsAfterParse = false;
         system.ParseHive();
 
@@ -219,7 +219,7 @@ internal class TestRegistrySkeleton
     [Test]
     public void BigDataCase()
     {
-        var usrclassDeleted = new RegistryHive(@".\Hives\UsrClassDeletedBags.dat");
+        var usrclassDeleted = new RegistryHive(@"./Hives/UsrClassDeletedBags.dat");
         usrclassDeleted.RecoverDeleted = true;
         usrclassDeleted.FlushRecordListsAfterParse = false;
         usrclassDeleted.ParseHive();
@@ -254,7 +254,7 @@ internal class TestRegistrySkeleton
     [Test]
     public void RecursiveCase()
     {
-        var usrclassDeleted = new RegistryHive(@".\Hives\UsrClassDeletedBags.dat");
+        var usrclassDeleted = new RegistryHive(@"./Hives/UsrClassDeletedBags.dat");
         usrclassDeleted.RecoverDeleted = true;
         usrclassDeleted.FlushRecordListsAfterParse = false;
         usrclassDeleted.ParseHive();
@@ -298,7 +298,7 @@ internal class TestRegistrySkeleton
     [Test]
     public void DeletedCase()
     {
-        var usrclassDeleted = new RegistryHive(@".\Hives\UsrClassDeletedBags.dat");
+        var usrclassDeleted = new RegistryHive(@"./Hives/UsrClassDeletedBags.dat");
         usrclassDeleted.RecoverDeleted = true;
         usrclassDeleted.FlushRecordListsAfterParse = false;
         usrclassDeleted.ParseHive();
@@ -344,7 +344,7 @@ internal class TestRegistrySkeleton
     [Test]
     public void WrittenHiveShouldContain163ValuesInMuiCacheSubkey()
     {
-        var usrclassDeleted = new RegistryHive(@".\Hives\UsrClassDeletedBags.dat");
+        var usrclassDeleted = new RegistryHive(@"./Hives/UsrClassDeletedBags.dat");
         usrclassDeleted.RecoverDeleted = true;
         usrclassDeleted.FlushRecordListsAfterParse = false;
         usrclassDeleted.ParseHive();

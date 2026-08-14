@@ -1,0 +1,42 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net8.0</TargetFramework>
+        <OutputType>Exe</OutputType>
+        <IsPackable>false</IsPackable>
+        <AssemblyName>RegistryToolkit</AssemblyName>
+        <RootNamespace>RegistryToolkit</RootNamespace>
+        <Description>CLI toolkit for analyzing, validating, and repairing Windows Registry hive files (parsing, integrity checks, oversized/truncated hive recovery, bloat analysis, and key pruning/compaction).</Description>
+        <!-- Workstation GC (not Server GC) is used deliberately here. Server GC allocates one heap segment
+             per logical core, which on multi-core machines inflates RSS dramatically for this tool's
+             workload (rewriting multi-GB hives with millions of small NK/VK cell allocations) without a
+             corresponding throughput benefit; this is a single-threaded, I/O-bound batch CLI, not a
+             concurrent server workload. Measured against a real 2GB bloated NTUSER.DAT: Server GC peaked at
+             ~17GB RSS; Workstation GC peaked at ~9.5-11.5GB RSS for the identical compact run. See
+             docs/COMPACT_MEMORY_REDESIGN.md for the full investigation. -->
+        <ServerGarbageCollection>false</ServerGarbageCollection>
+        <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="CommandLineParser" Version="2.9.1" />
+        <PackageReference Include="Costura.Fody" Version="6.0.0">
+            <PrivateAssets>all</PrivateAssets>
+
+        </PackageReference>
+        <PackageReference Include="Serilog" Version="4.3.1" />
+        <PackageReference Include="Serilog.Sinks.Console" Version="6.1.1" />
+        <PackageReference Include="System.Net.Http" Version="4.3.4" />
+        <PackageReference Include="System.Text.RegularExpressions" Version="4.3.1" />
+        
+    </ItemGroup>
+
+    <ItemGroup>
+        <Folder Include="Properties\" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\Registry\Registry.csproj" />
+    </ItemGroup>
+
+</Project>

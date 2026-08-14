@@ -13,6 +13,7 @@ public class LiListRecord : IListTemplate, IRecordBase
     // private fields...
 
     private readonly int _size;
+    private List<uint> _offsets;
 
     // public constructors...
     /// <summary>
@@ -34,6 +35,8 @@ public class LiListRecord : IListTemplate, IRecordBase
     {
         get
         {
+            if (_offsets != null) return _offsets;
+
             var offsets = new List<uint>();
 
             var index = 0x8;
@@ -54,7 +57,10 @@ public class LiListRecord : IListTemplate, IRecordBase
                 counter += 1;
             }
 
-            return offsets;
+            // Cache to avoid re-parsing this list on every property access (see LxListRecord.Offsets).
+            _offsets = offsets;
+
+            return _offsets;
         }
     }
 

@@ -8,6 +8,7 @@ using System.Text;
 using Registry.Abstractions;
 using Registry.Cells;
 using Registry.Lists;
+using Serilog;
 
 namespace Registry;
 
@@ -29,13 +30,36 @@ public class RegistrySkeleton
 
     private readonly List<SkeletonKeyRoot> _keys;
 
+    private readonly HashSet<string> _excludedKeyPaths = new(StringComparer.OrdinalIgnoreCase);
+
     private readonly Dictionary<long, int> _skMap = new();
 
-    private int _currentOffsetInHbin = 0x20;
+    private long _currentOffsetInHbin = 0x20;
 
-    private byte[] _hbin = new byte[0];
+    // The output hbin region is written directly to a FileStream (opened lazily by WriteWholeHive/Write)
+    // instead of being buffered in one big in-memory byte[]. A single .NET array cannot exceed ~2GB
+    // (int.MaxValue elements) -- for a real-world bloated hive already at/near that ceiling (see
+    // docs/NTUSER_BLOAT_FINDINGS.md), reproducing it via --compact/--pruneKey with an in-memory buffer either
+    // silently corrupted its own growth arithmetic near the 2GB boundary or exhausted tens of GB of RSS from
+    // superseded Large-Object-Heap buffers accumulating across successive doublings. Writing directly to a
+    // random-access FileStream removes both problems: there is no single-array size ceiling, and the OS page
+    // cache (not the CLR heap) absorbs the memory pressure of a multi-GB output file. ProcessKey's existing
+    // "reserve nkOffset before recursing into children, backfill final nkBytes after" pattern still works
+    // unchanged against a FileStream, since FileStream (like the old byte[]) supports random-access writes
+    // via Seek.
+    private FileStream _hbinStream;
+    private long _hbinLength;
 
-    private int _relativeOffset;
+    private long _relativeOffset;
+
+    private long _keysWritten;
+    private const int WriteProgressLogIntervalKeys = 10_000;
+    private Stopwatch _writeProgressStopwatch;
+
+    // Memoizes ProcessKey() results by key path so that redundant re-visits of the same key (an inherent
+    // side effect of ProcessSkeletonTree()'s tree recursion combined with ProcessKey()'s own SubKeys
+    // recursion -- see comment in ProcessKey()) are O(1) lookups instead of full re-writes.
+    private readonly Dictionary<string, int> _processedKeyOffsets = new(StringComparer.OrdinalIgnoreCase);
 
     public RegistrySkeleton(RegistryHive hive)
     {
@@ -120,7 +144,106 @@ public class RegistrySkeleton
         return true;
     }
 
-    private byte[] GetEmptyHbin(int size)
+    /// <summary>
+    ///     Removes every previously-added entry whose KeyPath equals <paramref name="keyPath" /> or is nested
+    ///     beneath it (i.e. KeyPath == keyPath or KeyPath starts with "keyPath\"), in a single O(n) pass.
+    ///     <remarks>
+    ///         Intended for bulk pruning of large subtrees (e.g. hundreds of thousands of subkeys), where
+    ///         repeatedly calling <see cref="RemoveEntry" /> one entry at a time would be O(n^2) since it
+    ///         performs a linear scan per call.
+    ///     </remarks>
+    /// </summary>
+    /// <param name="keyPath">The key path (subtree root) to remove, along with everything nested beneath it.</param>
+    /// <returns>The number of entries removed.</returns>
+    public int RemoveEntrySubtree(string keyPath)
+    {
+        if (keyPath.StartsWith(_hive.Root.KeyName, StringComparison.OrdinalIgnoreCase) == false)
+        {
+            keyPath = $"{_hive.Root.KeyName}\\{keyPath}";
+        }
+
+        var prefix = keyPath + "\\";
+
+        return _keys.RemoveAll(k =>
+            string.Equals(k.KeyPath, keyPath, StringComparison.OrdinalIgnoreCase) ||
+            k.KeyPath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    ///     Excludes the given key path (and, implicitly, everything nested beneath it, since ProcessKey never
+    ///     descends into an excluded key) from the output hive produced by <see cref="Write" />.
+    ///     <remarks>
+    ///         Unlike <see cref="RemoveEntrySubtree" />, which only removes entries this skeleton was told to
+    ///         explicitly add, this affects the *default* recursive copy behavior: when reproducing an entire
+    ///         hive (or a large subtree) via <see cref="AddEntry" /> with <c>Recursive = true</c>, excluded
+    ///         key paths are skipped entirely rather than being copied into the output.
+    ///     </remarks>
+    /// </summary>
+    /// <param name="keyPath">The key path (subtree root) to exclude when writing the output hive.</param>
+    public void ExcludeSubtree(string keyPath)
+    {
+        if (keyPath.StartsWith(_hive.Root.KeyName, StringComparison.OrdinalIgnoreCase) == false)
+        {
+            keyPath = $"{_hive.Root.KeyName}\\{keyPath}";
+        }
+
+        _excludedKeyPaths.Add(keyPath);
+    }
+
+    /// <summary>
+    ///     Writes <paramref name="bytes" /> at absolute output-file offset <paramref name="hbinRelativeOffset" />
+    ///     + 0x1000 (i.e. relative to the start of the hbin region, matching every existing call site's
+    ///     "relative offset" convention), extending <see cref="_hbinStream" />'s length first if necessary.
+    ///     Replaces the old <c>bytes.CopyTo(_hbin, offset)</c> pattern used throughout this class when
+    ///     <c>_hbin</c> was an in-memory <c>byte[]</c>.
+    /// </summary>
+    private void WriteAt(long hbinRelativeOffset, byte[] bytes)
+    {
+        // NOTE: hbinRelativeOffset and the resulting absolute file position must be tracked/computed
+        // as long throughout this class. hbinRelativeOffset can approach/exceed ~2.1GB for very large
+        // hives, and doing this bookkeeping in plain int (as originally written) silently overflows/wraps
+        // negative right around that point -- corrupting every subsequent offset and eventually causing
+        // Seek to receive a negative/garbage position and throw "Invalid argument". Using long here (and
+        // in _hbinLength/_currentOffsetInHbin/_relativeOffset) avoids that; the actual 32-bit hive format
+        // fields are still validated/cast down via <see cref="ToCellOffset" /> at the point they're
+        // serialized into on-disk cell headers.
+        _hbinStream.Seek(0x1000L + hbinRelativeOffset, SeekOrigin.Begin);
+        _hbinStream.Write(bytes, 0, bytes.Length);
+    }
+
+    /// <summary>
+    ///     Narrows a long-tracked internal offset down to the <c>int</c> actually stored in on-disk hive
+    ///     cell headers (which are natively 32-bit fields), throwing a clear, actionable error instead of
+    ///     silently truncating/wrapping if the hive has grown past what the on-disk format itself can
+    ///     address (~2GB, the same ceiling reflected in <see cref="RegistryBase.MaxByteArrayLength" />).
+    /// </summary>
+    private static int ToCellOffset(long offset)
+    {
+        if (offset > RegistryBase.MaxByteArrayLength)
+        {
+            throw new InvalidOperationException(
+                $"Cannot write this hive: required offset 0x{offset:X} exceeds the hive format's own ~2GB addressing limit (0x{RegistryBase.MaxByteArrayLength:X}). " +
+                "The output hive itself is too large for the registry format's 32-bit cell offsets, independent of any in-memory buffer limit.");
+        }
+
+        return (int) offset;
+    }
+
+    /// <summary>
+    ///     Appends a freshly-created, empty hbin chunk of <paramref name="size" /> bytes to the logical end
+    ///     of the output hbin region, extending <see cref="_hbinStream" /> as needed.
+    ///     <remarks>
+    ///         Unlike the old in-memory <c>byte[] _hbin</c> (which had to double its allocated capacity ahead
+    ///         of need to amortize reallocation+copy costs, and which was hard-capped at ~2GB since .NET
+    ///         arrays cannot exceed <c>int.MaxValue</c> elements), a <see cref="FileStream" /> has no such
+    ///         capacity/doubling concept or upper size limit -- appending here simply means writing the new
+    ///         hbin's header bytes at the stream's current logical end. This is what allows this writer to
+    ///         reproduce hives at/above the historical ~2GB ceiling that made an in-memory-array-backed
+    ///         writer either silently corrupt its own growth arithmetic or exhaust tens of GB of RSS from
+    ///         superseded Large-Object-Heap buffers (see docs/COMPACT_MEMORY_REDESIGN.md for the full history).
+    ///     </remarks>
+    /// </summary>
+    private void AppendHbin(int size)
     {
         var newHbin = new byte[size];
 
@@ -137,7 +260,8 @@ public class RegistrySkeleton
 
         BitConverter.GetBytes(DateTimeOffset.UtcNow.ToFileTime()).CopyTo(newHbin, 0x14); //last write
 
-        return newHbin;
+        WriteAt(_hbinLength, newHbin);
+        _hbinLength += size;
     }
 
     public bool Write(string outHive)
@@ -147,22 +271,94 @@ public class RegistrySkeleton
 
         if (File.Exists(outHive)) File.Delete(outHive);
 
-        _hbin = _hbin.Concat(GetEmptyHbin(0x1000)).ToArray();
+        // Reserve the first 0x1000 bytes of outHive for the header (patched in FinalizeAndWrite once the
+        // final root-cell offset/checksum are known) and start the hbin region right after it.
+        using (_hbinStream = new FileStream(outHive, FileMode.Create, FileAccess.ReadWrite))
+        {
+            _hbinStream.SetLength(0x1000);
+
+            AppendHbin(0x1000);
+
+            var treeKey = BuildKeyTree();
+
+            var parentOffset = ProcessSkeletonTree(treeKey); //always include keys/values for now
+
+            FinalizeAndWrite(parentOffset);
+        }
+
+        _hbinStream = null;
+
+        return true;
+    }
+
+    /// <summary>
+    ///     Reproduces the entire hive (from <see cref="RegistryHive.Root" /> down, optionally excluding
+    ///     subtrees previously registered via <see cref="ExcludeSubtree" />) directly into
+    ///     <paramref name="outHive" />, without going through <see cref="AddEntry" />/<see cref="BuildKeyTree" />
+    ///     /<see cref="SkeletonKey" /> at all.
+    ///     <remarks>
+    ///         <see cref="AddEntry" /> (with <c>Recursive = true</c>) followed by <see cref="BuildKeyTree" />
+    ///         exists to let callers assemble an arbitrary, possibly-overlapping *union* of individually-added
+    ///         key paths into one output hive -- a flat list of path strings (Copy #1 of the tree) gets
+    ///         rebuilt into an isomorphic <see cref="SkeletonKey" /> tree (Copy #2, each node carrying its own
+    ///         List/Dictionary). For <c>Registry.Compaction.HivePruner</c>'s and <c>--compact</c>'s
+    ///         always-whole-root use case, this reproduces the *entire* real
+    ///         <see cref="RegistryKey" /> tree (already resident in memory from parsing, Copy #0) as two more
+    ///         fully-materialized, isomorphic in-memory copies --
+    ///         for a hive with ~1M keys that is the actual source of the ~25-29GB peak RSS observed compacting
+    ///         a bloated real-world hive (the resulting output hbin itself was only ~1GB). <see cref="ProcessKey" />
+    ///         already re-walks the real <see cref="RegistryKey" /> tree to do its byte-level work regardless
+    ///         of what SkeletonKey tree drove it there, so none of that duplication is actually needed for
+    ///         this "reproduce everything, minus some excluded subtrees" case -- this method recurses
+    ///         <see cref="ProcessKey" /> directly against <see cref="RegistryHive.Root" />, eliminating both
+    ///         duplicate copies while leaving <see cref="ProcessKey" />'s own logic (including its
+    ///         reserve-then-backfill write pattern and native parent-before-children physical layout)
+    ///         completely unchanged. Combined with writing directly to a <see cref="FileStream" /> (see field
+    ///         comment on <see cref="_hbinStream" />) instead of an in-memory <c>byte[]</c>, this keeps both
+    ///         peak memory usage and maximum output hive size unbounded by CLR array/heap limits.
+    ///     </remarks>
+    /// </summary>
+    /// <param name="outHive">Path to write the resulting hive to.</param>
+    /// <returns>True on success.</returns>
+    public bool WriteWholeHive(string outHive)
+    {
+        if (File.Exists(outHive)) File.Delete(outHive);
+
+        using (_hbinStream = new FileStream(outHive, FileMode.Create, FileAccess.ReadWrite))
+        {
+            _hbinStream.SetLength(0x1000);
+
+            AppendHbin(0x1000);
+
+            var parentOffset = ProcessKey(_hive.Root, -1, true, true);
+
+            FinalizeAndWrite(parentOffset);
+        }
+
+        _hbinStream = null;
+
+        return true;
+    }
 
 
-        var treeKey = BuildKeyTree();
-
-        var parentOffset = ProcessSkeletonTree(treeKey); //always include keys/values for now
-
+    /// <summary>
+    ///     Shared tail end of <see cref="Write" />/<see cref="WriteWholeHive" />: marks any leftover hbin
+    ///     space free, patches the header's hbin length/root-cell-offset/minor-version fields, recomputes the
+    ///     header checksum, and writes the finalized header into the first 0x1000 bytes of
+    ///     <see cref="_hbinStream" /> (already open on the output file; the hbin region itself was written
+    ///     directly to the stream as processing proceeded, so there is nothing left to copy/flush here).
+    /// </summary>
+    private void FinalizeAndWrite(int parentOffset)
+    {
         //mark any remaining hbin as free
-        var freeSize = _hbin.Length - _currentOffsetInHbin;
-        if (freeSize > 0) BitConverter.GetBytes(freeSize).CopyTo(_hbin, _currentOffsetInHbin);
+        var freeSize = _hbinLength - _currentOffsetInHbin;
+        if (freeSize > 0) WriteAt(_currentOffsetInHbin, BitConverter.GetBytes((int) freeSize));
 
         //work is done, get header, update rootcelloffset, adjust its length to match new hbin length, and write it out
 
         var headerBytes = _hive.ReadBytesFromHive(0, 0x1000);
 
-        BitConverter.GetBytes(_hbin.Length).CopyTo(headerBytes, 0x28);
+        BitConverter.GetBytes(ToCellOffset(_hbinLength)).CopyTo(headerBytes, 0x28);
         BitConverter.GetBytes(5).CopyTo(headerBytes, HeaderMinorVersion);
         BitConverter.GetBytes(parentOffset).CopyTo(headerBytes, RootCellIndex);
 
@@ -179,32 +375,30 @@ public class RegistrySkeleton
 
         BitConverter.GetBytes(newcs).CopyTo(headerBytes, CheckSumOffset);
 
-        var outBytes = headerBytes.Concat(_hbin).ToArray();
-
-        File.WriteAllBytes(outHive, outBytes);
-
-        return true;
+        _hbinStream.Seek(0, SeekOrigin.Begin);
+        _hbinStream.Write(headerBytes, 0, headerBytes.Length);
+        _hbinStream.Flush();
     }
 
     private void CheckhbinSize(int recordSize)
     {
-        if (_currentOffsetInHbin + recordSize > _hbin.Length)
+        if (_currentOffsetInHbin + recordSize > _hbinLength)
         {
             //we need to add another hbin
 
             //set remaining space to free record
-            var freeSize = _hbin.Length - _currentOffsetInHbin;
-            if (freeSize > 0) BitConverter.GetBytes(freeSize).CopyTo(_hbin, _currentOffsetInHbin);
+            var freeSize = _hbinLength - _currentOffsetInHbin;
+            if (freeSize > 0) WriteAt(_currentOffsetInHbin, BitConverter.GetBytes((int) freeSize));
 
             //go to end of current _hbin
-            _currentOffsetInHbin = _hbin.Length;
+            _currentOffsetInHbin = _hbinLength;
 
             //we have to make our hbin at least as big as the data that needs to go in it, so figure that out
             var hbinBaseSize = (int) Math.Ceiling(recordSize / (double) 4096);
             var hbinSize = hbinBaseSize * 0x1000;
 
             //add more space
-            _hbin = _hbin.Concat(GetEmptyHbin(hbinSize)).ToArray();
+            AppendHbin(hbinSize);
 
             //move pointer to next usable space
             _currentOffsetInHbin += 0x20;
@@ -222,9 +416,9 @@ public class RegistrySkeleton
             return _skMap[sk.RelativeOffset];
 
         CheckhbinSize(sk.RawBytes.Length);
-        sk.RawBytes.CopyTo(_hbin, _currentOffsetInHbin);
+        WriteAt(_currentOffsetInHbin, sk.RawBytes);
 
-        var skOffset = _currentOffsetInHbin;
+        var skOffset = ToCellOffset(_currentOffsetInHbin);
         _skMap.Add(sk.RelativeOffset, skOffset);
         _currentOffsetInHbin += sk.RawBytes.Length;
         return skOffset;
@@ -307,9 +501,9 @@ public class RegistrySkeleton
                     //add the size
 
                     CheckhbinSize(toWrite.Length);
-                    toWrite.CopyTo(_hbin, _currentOffsetInHbin);
+                    WriteAt(_currentOffsetInHbin, toWrite);
 
-                    dbOffsets.Add(_currentOffsetInHbin);
+                    dbOffsets.Add(ToCellOffset(_currentOffsetInHbin));
 
                     _currentOffsetInHbin += toWrite.Length;
                 }
@@ -334,9 +528,9 @@ public class RegistrySkeleton
                 //write offsetList to hbin
                 CheckhbinSize(offsetList.Length);
 
-                var offsetOffset = _currentOffsetInHbin;
+                var offsetOffset = ToCellOffset(_currentOffsetInHbin);
 
-                offsetList.CopyTo(_hbin, offsetOffset);
+                WriteAt(offsetOffset, offsetList);
                 _currentOffsetInHbin += offsetList.Length;
 
 
@@ -353,9 +547,9 @@ public class RegistrySkeleton
                         .Concat(new byte[4])
                         .ToArray();
 
-                var dbOffset = _currentOffsetInHbin;
+                var dbOffset = ToCellOffset(_currentOffsetInHbin);
                 CheckhbinSize(dbRaw.Length);
-                dbRaw.CopyTo(_hbin, dbOffset);
+                WriteAt(dbOffset, dbRaw);
 
                 _currentOffsetInHbin += dbRaw.Length;
 
@@ -372,9 +566,9 @@ public class RegistrySkeleton
                 dataraw.CopyTo(datarawBytes, 4);
 
                 CheckhbinSize(datarawBytes.Length);
-                datarawBytes.CopyTo(_hbin, _currentOffsetInHbin);
+                WriteAt(_currentOffsetInHbin, datarawBytes);
 
-                BitConverter.GetBytes(_currentOffsetInHbin).CopyTo(vkBytes, ValueDataOffset);
+                BitConverter.GetBytes(ToCellOffset(_currentOffsetInHbin)).CopyTo(vkBytes, ValueDataOffset);
 
                 _currentOffsetInHbin += datarawBytes.Length;
             }
@@ -382,13 +576,13 @@ public class RegistrySkeleton
 
         CheckhbinSize(vkBytes.Length);
 
-        var vkOffset = _currentOffsetInHbin;
+        var vkOffset = ToCellOffset(_currentOffsetInHbin);
 
         //update size of value so its found by other tools
         //TODO does this need to be optional?
         BitConverter.GetBytes(-1 * vkBytes.Length).CopyTo(vkBytes, 0);
 
-        vkBytes.CopyTo(_hbin, vkOffset);
+        WriteAt(vkOffset, vkBytes);
 
         _currentOffsetInHbin += vkBytes.Length;
 
@@ -398,6 +592,27 @@ public class RegistrySkeleton
 
     private int ProcessKey(RegistryKey key, int parentCellIndex, bool addValues, bool addSubkeys)
     {
+        // ProcessSkeletonTree() already walks the entire SkeletonKey tree built by BuildKeyTree() (which, for
+        // a Recursive AddEntry, is a full flattening of the real hive's subtree), AND ProcessKey() below
+        // independently re-walks the real key.SubKeys for every key it processes (addSubkeys is always true
+        // here). Combined, that means every key gets fully reprocessed -- along with its entire subtree --
+        // once for every ancestor level above it in the SkeletonKey tree, which is an O(depth) multiplier on
+        // top of an already O(n) walk. For a hive with 1M+ keys under one bloated parent this made the write
+        // phase effectively never finish. Memoizing by key path makes each real key get written exactly once:
+        // subsequent (redundant) visits just return the offset already recorded for it.
+        if (_processedKeyOffsets.TryGetValue(key.KeyPath, out var cachedOffset)) return cachedOffset;
+
+        _keysWritten += 1;
+        if (_keysWritten % WriteProgressLogIntervalKeys == 0)
+        {
+            _writeProgressStopwatch ??= Stopwatch.StartNew();
+            var elapsed = _writeProgressStopwatch.Elapsed;
+            var rate = elapsed.TotalSeconds > 0 ? _keysWritten / elapsed.TotalSeconds : 0;
+            Log.Information(
+                "Writing progress: {KeysWritten:N0} keys written so far ({ElapsedSeconds:N0}s elapsed, ~{Rate:N0} keys/sec, hbinBytes={HbinLen:N0}, managedMB={ManagedMB:N0})",
+                _keysWritten, elapsed.TotalSeconds, rate, _hbinLength, GC.GetTotalMemory(false) / 1024 / 1024);
+        }
+
         var skOffset = ProcessSkRecord(key.NkRecord.SecurityCellIndex);
 
         var classOffset = ProcessClassCell(key.NkRecord.ClassCellIndex);
@@ -406,7 +621,7 @@ public class RegistrySkeleton
         CheckhbinSize(key.NkRecord.RawBytes.Length);
 
         //this is where we will be placing our record
-        var nkOffset = _currentOffsetInHbin;
+        var nkOffset = ToCellOffset(_currentOffsetInHbin);
 
         //move our pointer to the beginning of free space for any subsequent records
         CheckhbinSize(key.NkRecord.RawBytes.Length);
@@ -433,10 +648,10 @@ public class RegistrySkeleton
 
             var valueListBytes = BuildValueList(valueOffsets);
             CheckhbinSize(valueListBytes.Length);
-            valueListBytes.CopyTo(_hbin, _currentOffsetInHbin);
+            WriteAt(_currentOffsetInHbin, valueListBytes);
 
             //update NK record to point to our new list of values and update the value count
-            BitConverter.GetBytes(_currentOffsetInHbin).CopyTo(nkBytes, ValueListCellIndex);
+            BitConverter.GetBytes(ToCellOffset(_currentOffsetInHbin)).CopyTo(nkBytes, ValueListCellIndex);
             BitConverter.GetBytes(valueOffsets.Count).CopyTo(nkBytes, ValueCountIndex);
 
             _currentOffsetInHbin += valueListBytes.Length;
@@ -452,7 +667,9 @@ public class RegistrySkeleton
         {
             var subkeyOffsets = new Dictionary<int, string>();
 
-            foreach (var registryKey in key.SubKeys)
+            var subKeysToInclude = key.SubKeys.Where(sk => !IsExcluded(sk.KeyPath)).ToList();
+
+            foreach (var registryKey in subKeysToInclude)
             {
                 var subkeyOffset = ProcessKey(registryKey, nkOffset, addValues, true);
 
@@ -463,24 +680,18 @@ public class RegistrySkeleton
                 subkeyOffsets.Add(subkeyOffset, hash);
             }
 
-            //TODO this should generate an ri list pointing to lh lists when the number of subkeys > 500. each lh should be 500 in size
-            //TODO test this with some hive that has a ton of keys
+            //TODO test the ri-chaining path below with additional real-world hives that have >500 subkeys under a single key
 
-            //write list and save address
-            var subkeyListBytes = BuildlfList(subkeyOffsets);
-
-            CheckhbinSize(subkeyListBytes.RawBytes.Length);
-            subkeyListBytes.RawBytes.CopyTo(_hbin, _currentOffsetInHbin);
+            //write list and save address (chunks into multiple lf lists + a chaining ri list when needed)
+            var subkeyListOffset = WriteSubkeyList(subkeyOffsets);
 
             //update nk record pointers to subkeylist and subkey count
-            BitConverter.GetBytes(_currentOffsetInHbin).CopyTo(nkBytes, SubkeyListsStableCellIndex);
+            BitConverter.GetBytes(subkeyListOffset).CopyTo(nkBytes, SubkeyListsStableCellIndex);
             BitConverter.GetBytes(subkeyOffsets.Count).CopyTo(nkBytes, SubkeyCountStableOffset);
 
             //update size to always be negative so it shows up in other tools
             //TODO maybe this needs to be optional
             BitConverter.GetBytes(-1 * nkBytes.Length).CopyTo(nkBytes, 0);
-
-            _currentOffsetInHbin += subkeyListBytes.RawBytes.Length;
         }
 
         //update nkBytes
@@ -495,7 +706,9 @@ public class RegistrySkeleton
 
         //commit our nk record to hbin
         CheckhbinSize(nkBytes.Length);
-        nkBytes.CopyTo(_hbin, nkOffset);
+        WriteAt(nkOffset, nkBytes);
+
+        _processedKeyOffsets[key.KeyPath] = nkOffset;
 
         return nkOffset;
     }
@@ -529,15 +742,134 @@ public class RegistrySkeleton
 
         Debug.WriteLine($"Processing {treeKey.KeyPath}. AddValues: {treeKey.AddValues}");
 
+        // BuildKeyTree() flattens *every* key added via AddEntry(..., Recursive = true) into the SkeletonKey
+        // tree, including ones later marked excluded via ExcludeSubtree(). ProcessKey()'s own subkey-walk
+        // already filters excluded subkeys out of the *linked* subkey list via IsExcluded(), but that alone
+        // doesn't stop this recursion from still descending into (and fully writing out) every excluded
+        // key's NK/VK/SK cells -- for a prune of ~1M excluded keys that meant the vast majority of the write
+        // phase's work was wasted writing cells that would never be reachable from any parent. Skip
+        // recursing into excluded subtrees entirely.
+        if (IsExcluded(treeKey.KeyPath)) return -1;
+
         foreach (var skeletonKey in treeKey.Subkeys) ProcessSkeletonTree(skeletonKey);
 
         var key = _hive.GetKey(treeKey.KeyPath);
+
+        if (key == null)
+        {
+            throw new InvalidOperationException($"ProcessSkeletonTree: could not resolve key for path '{treeKey.KeyPath}'");
+        }
 
         var parentOffset = ProcessKey(key, -1, treeKey.AddValues, true);
 
         return parentOffset;
     }
 
+
+    private bool IsExcluded(string keyPath)
+    {
+        if (_excludedKeyPaths.Count == 0) return false;
+
+        // Walk up keyPath's own ancestor chain, checking each ancestor for exact membership in
+        // _excludedKeyPaths (an O(1) HashSet lookup). This correctly detects both an exact match and
+        // "keyPath is a descendant of an excluded subtree root" in O(depth) time, regardless of how many
+        // paths are excluded. The previous implementation scanned every excluded path per call
+        // (StartsWith), which made pruning O(totalKeys * excludedCount) -- for real-world cases where a
+        // large flat set of individually-named leaf subkeys is excluded (e.g. ~1M DiagConnectionCache
+        // subkeys), that was effectively O(n^2) and never finished in practice.
+        var candidate = keyPath;
+        while (true)
+        {
+            if (_excludedKeyPaths.Contains(candidate)) return true;
+
+            var lastSlash = candidate.LastIndexOf('\\');
+            if (lastSlash < 0) break;
+
+            candidate = candidate.Substring(0, lastSlash);
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    ///     Writes the given subkey offset/hash pairs as one or more "lf" list records, chunked into groups of
+    ///     at most 500 entries (a real-world Windows-observed convention), chained together via an "ri" list
+    ///     record when more than one chunk is required. Returns the relative offset of whichever list record
+    ///     the owning NK's SubkeyListsStableCellIndex should point to (either the single "lf" list, or the "ri"
+    ///     list if chunking was needed).
+    /// </summary>
+    private int WriteSubkeyList(Dictionary<int, string> subkeyOffsets)
+    {
+        const int maxEntriesPerLfList = 500;
+
+        if (subkeyOffsets.Count <= maxEntriesPerLfList)
+        {
+            var lfBytes = BuildlfList(subkeyOffsets);
+            CheckhbinSize(lfBytes.RawBytes.Length);
+            var lfOffset = ToCellOffset(_currentOffsetInHbin);
+            WriteAt(lfOffset, lfBytes.RawBytes);
+            _currentOffsetInHbin += lfBytes.RawBytes.Length;
+            return lfOffset;
+        }
+
+        // Chunk into groups of maxEntriesPerLfList, write each as its own "lf" list, then chain them via "ri".
+        var chunkOffsets = new List<int>();
+        var chunk = new Dictionary<int, string>();
+
+        foreach (var entry in subkeyOffsets)
+        {
+            chunk.Add(entry.Key, entry.Value);
+
+            if (chunk.Count == maxEntriesPerLfList)
+            {
+                chunkOffsets.Add(WriteLfChunk(chunk));
+                chunk = new Dictionary<int, string>();
+            }
+        }
+
+        if (chunk.Count > 0)
+        {
+            chunkOffsets.Add(WriteLfChunk(chunk));
+        }
+
+        var riBytes = BuildRiList(chunkOffsets);
+        CheckhbinSize(riBytes.Length);
+        var riOffset = ToCellOffset(_currentOffsetInHbin);
+        WriteAt(riOffset, riBytes);
+        _currentOffsetInHbin += riBytes.Length;
+
+        return riOffset;
+    }
+
+    private int WriteLfChunk(Dictionary<int, string> chunk)
+    {
+        var lfBytes = BuildlfList(chunk);
+        CheckhbinSize(lfBytes.RawBytes.Length);
+        var lfOffset = ToCellOffset(_currentOffsetInHbin);
+        WriteAt(lfOffset, lfBytes.RawBytes);
+        _currentOffsetInHbin += lfBytes.RawBytes.Length;
+        return lfOffset;
+    }
+
+    private byte[] BuildRiList(List<int> chunkOffsets)
+    {
+        var totalSize = 4 + 2 + 2 + chunkOffsets.Count * 4; //size + sig + num entries + offsets
+
+        var listBytes = new byte[totalSize];
+
+        BitConverter.GetBytes(-1 * totalSize).CopyTo(listBytes, 0);
+        Encoding.ASCII.GetBytes("ri").CopyTo(listBytes, 4);
+        BitConverter.GetBytes((short) chunkOffsets.Count).CopyTo(listBytes, 6);
+
+        var index = 0x8;
+        foreach (var offset in chunkOffsets)
+        {
+            BitConverter.GetBytes(offset).CopyTo(listBytes, index);
+            index += 4;
+        }
+
+        return listBytes;
+    }
 
     private LxListRecord BuildlfList(Dictionary<int, string> subkeyInfo)
     {
@@ -589,16 +921,16 @@ public class RegistrySkeleton
 
                 if (current.KeyName == segs.First() && seg == segs.First()) continue;
 
-                if (current.Subkeys.Any(t => t.KeyName == seg))
+                if (current.SubkeysByName.TryGetValue(seg, out var existingChild))
                 {
-                    current = current.Subkeys.Single(t => t.KeyName == seg);
+                    current = existingChild;
                     continue;
                 }
 
                 if (seg == segs.Last()) withVals = keyRoot.AddValues;
 
                 var sk = new SkeletonKey($"{current.KeyPath}\\{seg}", seg, withVals);
-                current.Subkeys.Add(sk);
+                current.AddSubkey(sk);
                 current = sk;
             }
         }
@@ -629,10 +961,23 @@ public class SkeletonKey
         KeyName = keyName;
         AddValues = addValues;
         Subkeys = new List<SkeletonKey>();
+        // Case-insensitive index of Subkeys by KeyName, kept in sync with the Subkeys list. Registry key
+        // names are case-insensitive, and BuildKeyTree() needs to find/create a child by name for every
+        // segment of every flattened key path -- for hives with very large sibling counts (e.g. 1M+
+        // subkeys under one parent) a linear Subkeys.Any()/Single() scan per lookup made tree
+        // reconstruction effectively O(n^2). This index makes that lookup O(1) instead.
+        SubkeysByName = new Dictionary<string, SkeletonKey>(StringComparer.OrdinalIgnoreCase);
     }
 
     public string KeyName { get; }
     public string KeyPath { get; }
     public bool AddValues { get; }
     public List<SkeletonKey> Subkeys { get; }
+    public Dictionary<string, SkeletonKey> SubkeysByName { get; }
+
+    public void AddSubkey(SkeletonKey child)
+    {
+        Subkeys.Add(child);
+        SubkeysByName[child.KeyName] = child;
+    }
 }

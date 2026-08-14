@@ -7,6 +7,8 @@ Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Registry", "Registry\Regist
 EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "ExampleApp", "ExampleApp\ExampleApp.csproj", "{59EA257D-E4A2-4820-B911-1D6A3C8C70F9}"
 EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "RegistryToolkit", "RegistryToolkit\RegistryToolkit.csproj", "{A8711963-472A-42C5-9EF5-7955D2053734}"
+EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Registry.Test", "Registry.Test\Registry.Test.csproj", "{0E97C9AC-C1FD-482F-A0DC-548F8402562A}"
 EndProject
 Global
@@ -22,6 +24,10 @@ Global
 		{59EA257D-E4A2-4820-B911-1D6A3C8C70F9}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
 		{59EA257D-E4A2-4820-B911-1D6A3C8C70F9}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{59EA257D-E4A2-4820-B911-1D6A3C8C70F9}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A8711963-472A-42C5-9EF5-7955D2053734}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A8711963-472A-42C5-9EF5-7955D2053734}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A8711963-472A-42C5-9EF5-7955D2053734}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A8711963-472A-42C5-9EF5-7955D2053734}.Release|Any CPU.Build.0 = Release|Any CPU
 		{0E97C9AC-C1FD-482F-A0DC-548F8402562A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
 		{0E97C9AC-C1FD-482F-A0DC-548F8402562A}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{0E97C9AC-C1FD-482F-A0DC-548F8402562A}.Release|Any CPU.ActiveCfg = Release|Any CPU

@@ -44,7 +44,14 @@ public class TransactionLog
 
         binaryReader.BaseStream.Seek(0, SeekOrigin.Begin);
 
-        FileBytes = binaryReader.ReadBytes((int) binaryReader.BaseStream.Length);
+        var streamLength = binaryReader.BaseStream.Length;
+        if (streamLength > RegistryBase.MaxByteArrayLength)
+        {
+            throw new ArgumentOutOfRangeException(nameof(logFile),
+                $"Transaction log file size (0x{streamLength:X}) exceeds parser byte-array limit (0x{RegistryBase.MaxByteArrayLength:X}).");
+        }
+
+        FileBytes = binaryReader.ReadBytes((int) streamLength);
         
         var header = ReadBytesFromHive(0, 4096);
 
@@ -52,7 +59,7 @@ public class TransactionLog
         
         if (h.Length > FileBytes.Length)
         {
-            var diff = Header.Length - FileBytes.Length;
+            var diff = h.Length - FileBytes.Length;
             //we need to add some bytes so the size is the same
             Log.Debug("Log size exceeds hive size. Adding {Diff} bytes to hive bytes",diff);
 
