@@ -7,10 +7,14 @@
         <AssemblyName>RegistryToolkit</AssemblyName>
         <RootNamespace>RegistryToolkit</RootNamespace>
         <Description>CLI toolkit for analyzing, validating, and repairing Windows Registry hive files (parsing, integrity checks, oversized/truncated hive recovery, bloat analysis, and key pruning/compaction).</Description>
-        <!-- Server GC handles large-heap, allocation-heavy workloads (e.g. rewriting multi-GB hives with
-             millions of small NK/VK cell allocations) far better than the default Workstation GC, which can
-             suffer severe throughput collapse and heap bloat under this kind of sustained allocation pressure. -->
-        <ServerGarbageCollection>true</ServerGarbageCollection>
+        <!-- Workstation GC (not Server GC) is used deliberately here. Server GC allocates one heap segment
+             per logical core, which on multi-core machines inflates RSS dramatically for this tool's
+             workload (rewriting multi-GB hives with millions of small NK/VK cell allocations) without a
+             corresponding throughput benefit; this is a single-threaded, I/O-bound batch CLI, not a
+             concurrent server workload. Measured against a real 2GB bloated NTUSER.DAT: Server GC peaked at
+             ~17GB RSS; Workstation GC peaked at ~9.5-11.5GB RSS for the identical compact run. See
+             docs/COMPACT_MEMORY_REDESIGN.md for the full investigation. -->
+        <ServerGarbageCollection>false</ServerGarbageCollection>
         <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
     </PropertyGroup>
 

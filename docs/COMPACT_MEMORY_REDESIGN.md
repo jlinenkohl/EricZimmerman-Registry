@@ -244,11 +244,15 @@ losslessly reproduce all of it — see §3.)
 
 ## 5. Verification against the real 2GB file
 
-All testing used a throwaway copy of the user's real, previously-`bak`-ed
-`NTUSER.DAT` (`2,147,483,648` bytes, ~1,023,207 keys/6,033,724 cell
-records), run under `DOTNET_gcServer=0` (workstation GC) for more
-predictable RSS readings; RSS was sampled every 5s via `/proc/<pid>/status`
-`VmRSS` throughout.
+All testing initially used a throwaway copy of the user's real,
+previously-`bak`-ed `NTUSER.DAT` (`2,147,483,648` bytes, ~1,023,207
+keys/6,033,724 cell records), run under `DOTNET_gcServer=0` (workstation
+GC) as an *env var override* for more predictable RSS readings during
+diagnosis; RSS was sampled every 5s via `/proc/<pid>/status` `VmRSS`
+throughout. **This env var override masked a real, separate bug in the
+shipped build's own GC configuration — see §7 — which caused the very
+first user-run verification of this rewrite (without the override) to see
+~17GB peak RSS instead of the ~9.5-11.5GB shown below.**
 
 | Stage | Peak RSS | Outcome |
 |---|---|---|
@@ -256,7 +260,8 @@ predictable RSS readings; RSS was sampled every 5s via `/proc/<pid>/status`
 | + doubling-overflow fix (§2.1) | ~20-25GB | Same crash, now with a logged exception once found |
 | + pre-sizing initial buffer to source length (§2.2 mitigation) | ~13GB | Same crash, confirmed as the fundamental `byte[]` 2GB ceiling (§2.3) |
 | `FileStream`-backed rewrite (§4), before `WriteAt`/offset overflow fix | ~9.5-11.5GB | Crashed with `Seek` `"Invalid argument"` near key ~870,000/hbinBytes≈2.13GB (§4.4) |
-| `FileStream`-backed rewrite, with `long` offset bookkeeping + `ToCellOffset` (final) | ~9.5-11.5GB | **Correctly fails fast** with a clear, actionable `InvalidOperationException` — no crash, no silent corruption, no confusing message |
+| `FileStream`-backed rewrite, with `long` offset bookkeeping + `ToCellOffset` (final) | ~9.5-11.5GB (under `DOTNET_gcServer=0` override) / **~17GB with the shipped build's actual default config** (§7 bug) / ~11.6GB after fixing the shipped default (§7 fix) | **Correctly fails fast** with a clear, actionable `InvalidOperationException` — no crash, no silent corruption, no confusing message |
+
 
 The final peak RSS (~9.5-11.5GB) reflects the cost of *parsing* the 2GB
 source hive into its in-memory `RegistryKey`/cell-record object graph (over
@@ -295,3 +300,67 @@ baseline, confirming no regressions from this change.
   alone already exceeds that limit (as with the user's real file),
   `--compact` now fails immediately with a clear explanation rather than
   hanging, exhausting memory, or crashing with a confusing message.
+
+## 7. A second, separate memory bug: Server GC in the shipped build
+
+After the `FileStream` rewrite above was verified and pushed, the user ran
+the actual shipped `RegistryToolkit` binary against the same real 2GB file
+and saw **~17GB peak RSS** for `--compact` — far higher than the
+~9.5-11.5GB shown in §5. This was surprising given the rewrite had just
+been verified to land at ~9.5-11.5GB, and pointed at a discrepancy between
+how the fix had been *tested* versus how the tool actually *ships*.
+
+### Root cause
+
+Every RSS measurement in §5 was taken with the diagnostic env var
+`DOTNET_gcServer=0` set, which force-overrides the .NET runtime to use
+**Workstation GC** for that process only. This was a deliberate, temporary
+measurement technique adopted earlier in this investigation (see §2.2's
+history) to get consistent, comparable RSS numbers while iterating on the
+writer itself — but it was never promoted into an actual fix, and
+`RegistryToolkit.csproj` still shipped with:
+
+```xml
+<ServerGarbageCollection>true</ServerGarbageCollection>
+```
+
+Server GC allocates one heap segment **per logical core** to maximize
+multi-threaded allocation throughput — appropriate for a concurrent web
+server, inappropriate for this tool, which is a single-threaded,
+I/O-bound, batch CLI command. On the 20-core machine used throughout this
+investigation, Server GC's per-core segments inflated RSS well past what
+Workstation GC showed for the identical workload, which is exactly why
+every prior verification in this document (run with the override) looked
+so much better than the user's real, unmodified-config run.
+
+This was confirmed directly: re-running the identical `--compact` command
+against the identical file, with no env var overrides, against the
+as-shipped binary, reproduced the user's ~17GB peak RSS exactly.
+
+### Fix
+
+Changed `RegistryToolkit.csproj`:
+
+```xml
+<ServerGarbageCollection>false</ServerGarbageCollection>
+<ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+```
+
+Re-verified against the same real 2GB file, with the rebuilt binary and
+**no env var overrides of any kind** (i.e. exactly how a user would run
+it): peak RSS dropped from ~17GB to **~11.6GB**, matching the numbers
+originally reported in §5 (the small difference from the ~9.5-11.5GB
+figure there is normal run-to-run variance, not a discrepancy). The tool's
+behavior (parse → compact → the same `InvalidOperationException` fail-fast
+for this specific file's over-the-format-limit live data) was otherwise
+identical.
+
+### Lesson
+
+Whenever a diagnostic env var override is used to get cleaner measurements
+mid-investigation, it must either be reverted before final verification, or
+explicitly promoted into the actual shipped configuration once confirmed
+correct — otherwise "verified" numbers can silently stop reflecting what
+users actually run. This gap is why the discrepancy wasn't caught until the
+user's own real-world test run surfaced it.
+
