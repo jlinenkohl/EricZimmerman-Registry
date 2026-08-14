@@ -559,9 +559,7 @@ internal class Program
             }
 
             var skeleton = new RegistrySkeleton(hive);
-            var rootEntry = new SkeletonKeyRoot(hive.Root.KeyName, true, true);
-            skeleton.AddEntry(rootEntry);
-            skeleton.Write(options.OutputPath);
+            skeleton.WriteWholeHive(options.OutputPath);
 
             Console.WriteLine($"Compacted hive written to: {options.OutputPath}");
 

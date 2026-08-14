@@ -75,10 +75,6 @@ public static class HivePruner
 
         var skeleton = new RegistrySkeleton(hive);
 
-        // Reproduce the entire hive from the root down, recursively, including values.
-        var rootEntry = new SkeletonKeyRoot(hive.Root.KeyName, true, true);
-        skeleton.AddEntry(rootEntry);
-
         // Exclude only the specific subkeys selected for pruning; everything else (including the target key
         // itself and its retained subkeys) is copied through unchanged.
         foreach (var pruneKeyPath in plan.SubkeysToPrune)
@@ -86,7 +82,10 @@ public static class HivePruner
             skeleton.ExcludeSubtree(pruneKeyPath);
         }
 
-        skeleton.Write(outputPath);
+        // Reproduce the entire hive from the root down (recursively, including values) directly against the
+        // real RegistryKey tree, bypassing AddEntry/BuildKeyTree/SkeletonKey's redundant, fully-materialized
+        // duplicate tree copies -- see WriteWholeHive's remarks for why that matters for large hives.
+        skeleton.WriteWholeHive(outputPath);
 
         return plan;
     }
